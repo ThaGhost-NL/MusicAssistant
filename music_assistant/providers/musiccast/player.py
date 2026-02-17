@@ -409,21 +409,24 @@ class MusicCastPlayer(Player):
                 )
             elif isinstance(capability, MCOptionSetter):
                 options = []
+                type_ = (
+                    PlayerOptionType.INTEGER
+                    if isinstance(capability.current, int)
+                    else PlayerOptionType.STRING
+                )
                 for option_key, option_name in capability.options.items():
                     options.append(
                         PlayerOptionEntry(
-                            key=str(option_key),  # aiomusiccast allows str and int.
                             name=option_name,
-                            value=str(option_key),
-                            type=PlayerOptionType.STRING,
+                            value=option_key,  # aiomusiccast allows str and int.
                         )
                     )
                 self._attr_options.append(
                     PlayerOption(
                         key=capability.id,
                         name=capability.name,
-                        type=PlayerOptionType.STRING,
-                        value=str(capability.current),
+                        type=type_,
+                        value=capability.current,
                         read_only=False,
                         options=UniqueList(options),
                     )
