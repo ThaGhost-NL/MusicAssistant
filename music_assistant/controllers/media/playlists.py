@@ -13,6 +13,7 @@ from music_assistant_models.errors import (
     ProviderUnavailableError,
 )
 from music_assistant_models.media_items import (
+    Album,
     Playlist,
     Track,
 )
@@ -89,41 +90,38 @@ class PlaylistController(MediaControllerBase[Playlist]):
         item_id: str,
         provider_instance_id_or_domain: str,
         force_refresh: bool = False,
-        _from_metadata_update: bool = False,
     ) -> AsyncGenerator[PlaylistPlayableItem, None]:
         """Return playlist tracks for the given provider playlist id."""
-        library_item = None
+        prov_item_id = item_id
+        prov_instance = provider_instance_id_or_domain
         if provider_instance_id_or_domain == "library":
             library_item = await self.get_library_item(item_id)
-            if not library_item or not library_item.provider_mappings:
-                return
-            provider_instance_id_or_domain, item_id = self._select_provider_id(library_item)
+            prov_instance, prov_item_id = self._select_provider_id(library_item)
         # playlist tracks are not stored in the db,
-        # we always fetched them (cached) from the provider
+        # we always fetch them (cached) from the provider.
+        # when force_refresh is set, collect genres in the same pass
+        # to avoid a second iteration of the track list.
+        genre_counts: dict[str, int] | None = {} if force_refresh else None
         page = 0
         while True:
             tracks = await self._get_provider_playlist_tracks(
-                item_id,
-                provider_instance_id_or_domain,
+                prov_item_id,
+                prov_instance,
                 page=page,
                 force_refresh=force_refresh,
             )
             if not tracks:
                 break
             for track in tracks:
+                if genre_counts is not None:
+                    for genre in self.get_track_genres(track):
+                        genre_counts[genre] = genre_counts.get(genre, 0) + 1
                 yield track
             page += 1
-
-        # trigger metadata update for builtin playlists when tracks are refreshed
-        if (
-            force_refresh
-            and library_item
-            and provider_instance_id_or_domain == "builtin"
-            and not _from_metadata_update
-        ):
-            self.mass.create_task(
-                self.mass.metadata.update_metadata(library_item, force_refresh=True)
-            )
+        if genre_counts:
+            db_item = await self.get_library_item_by_prov_id(prov_item_id, prov_instance)
+            if db_item:
+                await self._save_playlist_genres(db_item, genre_counts)
 
     async def create_playlist(
         self, name: str, provider_instance_or_domain: str | None = None
@@ -559,9 +557,53 @@ class PlaylistController(MediaControllerBase[Playlist]):
         """Refresh playlist tracks by forcing a cache refresh."""
 
         async def _refresh(playlist: Playlist) -> None:
-            # simply iterate all tracks with force_refresh=True to refresh the cache
             async for _ in self.tracks(playlist.item_id, playlist.provider, force_refresh=True):
                 pass
 
         task_id = f"refresh_playlist_tracks_{playlist.item_id}"
         self.mass.call_later(5, _refresh, playlist, task_id=task_id)  # debounce multiple calls
+
+    @staticmethod
+    def get_track_genres(track: PlaylistPlayableItem) -> set[str]:
+        """Extract genres from a track, falling back to album genres.
+
+        :param track: The track to extract genres from.
+        """
+        if track.metadata.genres:
+            return track.metadata.genres
+        if (
+            isinstance(track, Track)
+            and track.album
+            and isinstance(track.album, Album)
+            and track.album.metadata.genres
+        ):
+            return track.album.metadata.genres
+        return set()
+
+    @staticmethod
+    def filter_playlist_genres(genre_counts: dict[str, int]) -> set[str]:
+        """Filter, sort, and return top playlist genres from occurrence counts.
+
+        :param genre_counts: Mapping of genre name to occurrence count.
+        """
+        if not genre_counts:
+            return set()
+        # for small playlists keep all genres, for larger ones filter to significant ones
+        total = sum(genre_counts.values())
+        if total <= 20:
+            filtered = set(genre_counts.keys())
+        else:
+            min_count = min(5, total // 10)
+            filtered = {genre for genre, count in genre_counts.items() if count > min_count}
+        sorted_genres = sorted(filtered, key=lambda g: genre_counts.get(g, 0), reverse=True)
+        return set(sorted_genres[:8])
+
+    async def _save_playlist_genres(self, playlist: Playlist, genre_counts: dict[str, int]) -> None:
+        """Persist playlist genres from pre-computed counts.
+
+        :param playlist: The playlist to update.
+        :param genre_counts: Mapping of genre name to occurrence count.
+        """
+        cur_item = await self.get_library_item(int(playlist.item_id))
+        cur_item.metadata.genres = self.filter_playlist_genres(genre_counts)
+        await self.update_item_in_library(cur_item.item_id, cur_item, overwrite=True)
