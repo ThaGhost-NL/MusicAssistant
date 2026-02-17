@@ -116,15 +116,13 @@ class PlaylistController(MediaControllerBase[Playlist]):
         item_id: str,
         provider_instance_id_or_domain: str,
         force_refresh: bool = False,
-        _from_metadata_update: bool = False,
     ) -> AsyncGenerator[PlaylistPlayableItem, None]:
         """Return playlist tracks for the given provider playlist id."""
-        library_item = None
+        prov_item_id = item_id
+        prov_instance = provider_instance_id_or_domain
         if provider_instance_id_or_domain == "library":
             library_item = await self.get_library_item(item_id)
-            if not library_item or not library_item.provider_mappings:
-                return
-            provider_instance_id_or_domain, item_id = self._select_provider_id(library_item)
+            prov_instance, prov_item_id = self._select_provider_id(library_item)
         # playlist tracks are not stored in the db,
         # we always fetch them (cached) from the provider.
         # when force_refresh is set, collect genres in the same pass
@@ -146,17 +144,10 @@ class PlaylistController(MediaControllerBase[Playlist]):
                         genre_counts[genre] = genre_counts.get(genre, 0) + 1
                 yield track
             page += 1
-
-        # trigger metadata update for builtin playlists when tracks are refreshed
-        if (
-            force_refresh
-            and library_item
-            and provider_instance_id_or_domain == "builtin"
-            and not _from_metadata_update
-        ):
-            self.mass.create_task(
-                self.mass.metadata.update_metadata(library_item, force_refresh=True)
-            )
+        if genre_counts:
+            db_item = await self.get_library_item_by_prov_id(prov_item_id, prov_instance)
+            if db_item:
+                await self._save_playlist_genres(db_item, genre_counts)
 
     async def create_playlist(
         self,
@@ -791,3 +782,166 @@ class PlaylistController(MediaControllerBase[Playlist]):
         await provider.remove_playlist_tracks(playlist_prov_item_id, positions_to_remove)
 
         await self.update_item_in_library(db_playlist_id, playlist)
+
+    async def _add_library_item(self, item: Playlist, overwrite_existing: bool = False) -> int:
+        """Add a new record to the database."""
+        db_id = await self.mass.music.database.insert(
+            self.db_table,
+            {
+                "name": item.name,
+                "sort_name": item.sort_name,
+                "owner": item.owner,
+                "is_editable": item.is_editable,
+                "favorite": item.favorite,
+                "metadata": serialize_to_json(item.metadata),
+                "external_ids": serialize_to_json(item.external_ids),
+                "search_name": create_safe_string(item.name, True, True),
+                "search_sort_name": create_safe_string(item.sort_name or "", True, True),
+                "timestamp_added": int(item.date_added.timestamp()) if item.date_added else UNSET,
+            },
+        )
+        # update/set provider_mappings table
+        await self.set_provider_mappings(db_id, item.provider_mappings)
+        self.logger.debug("added %s to database (id: %s)", item.name, db_id)
+        return db_id
+
+    async def _update_library_item(
+        self, item_id: str | int, update: Playlist, overwrite: bool = False
+    ) -> None:
+        """Update existing record in the database."""
+        db_id = int(item_id)  # ensure integer
+        cur_item = await self.get_library_item(db_id)
+        self._verify_update_allowed(cur_item, update)
+        metadata = update.metadata if overwrite else cur_item.metadata.update(update.metadata)
+        cur_item.external_ids.update(update.external_ids)
+        name = update.name if overwrite else cur_item.name
+        sort_name = update.sort_name if overwrite else cur_item.sort_name or update.sort_name
+        await self.mass.music.database.update(
+            self.db_table,
+            {"item_id": db_id},
+            {
+                # always prefer name/owner from updated item here
+                "name": name,
+                "sort_name": sort_name,
+                "owner": update.owner or cur_item.owner,
+                "is_editable": update.is_editable,
+                "metadata": serialize_to_json(metadata),
+                "external_ids": serialize_to_json(
+                    update.external_ids if overwrite else cur_item.external_ids
+                ),
+                "search_name": create_safe_string(name, True, True),
+                "search_sort_name": create_safe_string(sort_name or "", True, True),
+                "timestamp_added": int(update.date_added.timestamp())
+                if update.date_added
+                else UNSET,
+            },
+        )
+        # update/set provider_mappings table
+        provider_mappings = (
+            update.provider_mappings
+            if overwrite
+            else {*update.provider_mappings, *cur_item.provider_mappings}
+        )
+        await self.set_provider_mappings(db_id, provider_mappings, overwrite)
+        self.logger.debug("updated %s in database: (id %s)", update.name, db_id)
+
+    @guard_single_request  # type: ignore[type-var]  # TODO: fix typing in util.py
+    async def _get_provider_playlist_tracks(
+        self,
+        item_id: str,
+        provider_instance_id_or_domain: str,
+        page: int = 0,
+        force_refresh: bool = False,
+    ) -> list[PlaylistPlayableItem]:
+        """Return playlist tracks for the given provider playlist id."""
+        assert provider_instance_id_or_domain != "library"
+        if not (provider := self.mass.get_provider(provider_instance_id_or_domain)):
+            return []
+        provider = cast("MusicProvider", provider)
+        async with self.mass.cache.handle_refresh(force_refresh):
+            # Builtin provider overrides to return list[PlaylistPlayableItem],
+            # others return list[Track]. Since Track is part of PlaylistPlayableItem union,
+            # this is safe at runtime. Type ignore needed because list is invariant.
+            return await provider.get_playlist_tracks(item_id, page=page)  # type: ignore[return-value]
+
+    async def radio_mode_base_tracks(
+        self,
+        item: Playlist,
+        preferred_provider_instances: list[str] | None = None,
+    ) -> list[Track]:
+        """
+        Get the list of base tracks from the controller used to calculate the dynamic radio.
+
+        :param item: The Playlist to get base tracks for.
+        :param preferred_provider_instances: List of preferred provider instance IDs to use.
+        """
+        return [
+            x
+            async for x in self.tracks(item.item_id, item.provider)
+            # Radio mode only works with Tracks (filter out all other types)
+            if isinstance(x, Track) and x.available
+        ]
+
+    async def match_providers(self, db_item: Playlist) -> None:
+        """Try to find match on all (streaming) providers for the provided (database) item.
+
+        This is used to link objects of different providers/qualities together.
+        """
+        # playlists can only be matched on the same provider (if not unique)
+        if self.mass.music.match_provider_instances(db_item):
+            await self.add_provider_mappings(db_item.item_id, db_item.provider_mappings)
+
+    def _refresh_playlist_tracks(self, playlist: Playlist) -> None:
+        """Refresh playlist tracks by forcing a cache refresh."""
+
+        async def _refresh(playlist: Playlist) -> None:
+            async for _ in self.tracks(playlist.item_id, playlist.provider, force_refresh=True):
+                pass
+
+        task_id = f"refresh_playlist_tracks_{playlist.item_id}"
+        self.mass.call_later(5, _refresh, playlist, task_id=task_id)  # debounce multiple calls
+
+    @staticmethod
+    def get_track_genres(track: PlaylistPlayableItem) -> set[str]:
+        """Extract genres from a track, falling back to album genres.
+
+        :param track: The track to extract genres from.
+        """
+        if track.metadata.genres:
+            return track.metadata.genres
+        if (
+            isinstance(track, Track)
+            and track.album
+            and isinstance(track.album, Album)
+            and track.album.metadata.genres
+        ):
+            return track.album.metadata.genres
+        return set()
+
+    @staticmethod
+    def filter_playlist_genres(genre_counts: dict[str, int]) -> set[str]:
+        """Filter, sort, and return top playlist genres from occurrence counts.
+
+        :param genre_counts: Mapping of genre name to occurrence count.
+        """
+        if not genre_counts:
+            return set()
+        # for small playlists keep all genres, for larger ones filter to significant ones
+        total = sum(genre_counts.values())
+        if total <= 20:
+            filtered = set(genre_counts.keys())
+        else:
+            min_count = min(5, total // 10)
+            filtered = {genre for genre, count in genre_counts.items() if count > min_count}
+        sorted_genres = sorted(filtered, key=lambda g: genre_counts.get(g, 0), reverse=True)
+        return set(sorted_genres[:8])
+
+    async def _save_playlist_genres(self, playlist: Playlist, genre_counts: dict[str, int]) -> None:
+        """Persist playlist genres from pre-computed counts.
+
+        :param playlist: The playlist to update.
+        :param genre_counts: Mapping of genre name to occurrence count.
+        """
+        cur_item = await self.get_library_item(int(playlist.item_id))
+        cur_item.metadata.genres = self.filter_playlist_genres(genre_counts)
+        await self.update_item_in_library(cur_item.item_id, cur_item, overwrite=True)

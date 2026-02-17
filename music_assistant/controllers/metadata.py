@@ -155,8 +155,6 @@ class MetaDataController(CoreController):
         )
         self.manifest.icon = "book-information-variant"
         self._throttler = Throttler(1, 30)
-        # track pending metadata update requests per URI to cancel stale ones
-        self._pending_updates: dict[str, int] = {}
 
     async def get_config_entries(
         self,
@@ -306,22 +304,7 @@ class MetaDataController(CoreController):
             # just in case it was in the queue, prevent duplicate lookups
             if item.uri:
                 self._lookup_jobs.pop(item.uri)
-
-            # playlists don't need online metadata lookups, so bypass the throttler
-            if item.media_type == MediaType.PLAYLIST:
-                await self._update_playlist_metadata(
-                    cast("Playlist", item), force_refresh=force_refresh
-                )
-                return item
-
-            # track request ID to skip stale requests after waiting for throttler
-            uri = item.uri or ""
-            request_id = id(asyncio.current_task())
-            self._pending_updates[uri] = request_id
-
             async with self._throttler:
-                if self._pending_updates.get(uri) != request_id:
-                    return item
                 if item.media_type == MediaType.ARTIST:
                     await self._update_artist_metadata(
                         cast("Artist", item), force_refresh=force_refresh
@@ -333,6 +316,10 @@ class MetaDataController(CoreController):
                 if item.media_type == MediaType.TRACK:
                     await self._update_track_metadata(
                         cast("Track", item), force_refresh=force_refresh
+                    )
+                if item.media_type == MediaType.PLAYLIST:
+                    await self._update_playlist_metadata(
+                        cast("Playlist", item), force_refresh=force_refresh
                     )
                 if item.media_type == MediaType.AUDIOBOOK:
                     await self._update_audiobook_metadata(
@@ -783,6 +770,8 @@ class MetaDataController(CoreController):
         self, playlist: Playlist, force_refresh: bool = False
     ) -> None:
         """Get/update rich metadata for a playlist."""
+        # collect metadata + create collage images
+        # NOTE: we only do/allow this every REFRESH_INTERVAL
         needs_refresh = (
             time() - (playlist.metadata.last_refresh or 0)
         ) > REFRESH_INTERVAL_PLAYLISTS
@@ -791,14 +780,9 @@ class MetaDataController(CoreController):
         self.logger.debug("Updating metadata for Playlist %s", playlist.name)
         all_playlist_tracks_images: list[MediaItemImage] = []
         playlist_genres: dict[str, int] = {}
-        # for builtin playlists, always force refresh tracks since they change dynamically
-        is_builtin = any(pm.provider_instance == "builtin" for pm in playlist.provider_mappings)
-        async for track in self.mass.music.playlists.tracks(
-            playlist.item_id,
-            playlist.provider,
-            force_refresh=force_refresh or is_builtin,
-            _from_metadata_update=True,
-        ):
+        # retrieve metadata for the playlist from the tracks (such as genres etc.)
+        # TODO: retrieve style/mood ?
+        async for track in self.mass.music.playlists.tracks(playlist.item_id, playlist.provider):
             if (
                 track.image
                 and track.image not in all_playlist_tracks_images
@@ -814,18 +798,7 @@ class MetaDataController(CoreController):
                 playlist_genres[genre] += 1
             await asyncio.sleep(0)  # yield to eventloop
 
-        total_tracks = sum(playlist_genres.values()) if playlist_genres else 0
-        if total_tracks <= 20:
-            playlist_genres_filtered = set(playlist_genres.keys())
-        else:
-            min_count = min(5, total_tracks // 10)
-            playlist_genres_filtered = {
-                genre for genre, count in playlist_genres.items() if count > min_count
-            }
-        sorted_genres = sorted(
-            playlist_genres_filtered, key=lambda g: playlist_genres[g], reverse=True
-        )
-        playlist.metadata.genres.update(sorted_genres[:8])
+        playlist.metadata.genres = self.mass.music.playlists.filter_playlist_genres(playlist_genres)
         # create collage images
         cur_images: list[MediaItemImage] = playlist.metadata.images or []
         new_images = []
