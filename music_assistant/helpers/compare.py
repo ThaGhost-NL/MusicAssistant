@@ -521,8 +521,12 @@ def create_safe_string(input_str: str, lowercase: bool = True, replace_space: bo
         input_str = input_str.replace("$hort", "short")
     input_str = input_str.lower().strip() if lowercase else input_str.strip()
     unaccented_string = unidecode.unidecode(input_str)
-    regex = r"[^a-zA-Z0-9]" if replace_space else r"[^a-zA-Z0-9 ]"
-    return re.sub(regex, "", unaccented_string)
+    if replace_space:
+        return re.sub(r"[^a-zA-Z0-9]", "", unaccented_string)
+    # Replace non-alphanumeric characters with spaces instead of removing them
+    # to preserve word boundaries (e.g., "07:02" → "07 02" instead of "0702")
+    result = re.sub(r"[^a-zA-Z0-9 ]", " ", unaccented_string)
+    return re.sub(r" +", " ", result).strip()
 
 
 def loose_compare_strings(base: str, alt: str) -> bool:
