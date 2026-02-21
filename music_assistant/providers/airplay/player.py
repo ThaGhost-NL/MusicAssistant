@@ -16,6 +16,7 @@ from music_assistant_models.enums import (
 )
 
 from music_assistant.constants import CONF_ENTRY_SYNC_ADJUST, create_sample_rates_config_entry
+from music_assistant.helpers.util import is_valid_mac_address
 from music_assistant.models.player import DeviceInfo, Player, PlayerMedia
 
 from .constants import (
@@ -36,6 +37,8 @@ from .constants import (
     CONF_PASSWORD,
     CONF_RAOP_CREDENTIALS,
     FALLBACK_VOLUME,
+    LEGACY_PAIRING_BIT,
+    PIN_REQUIRED,
     RAOP_DISCOVERY_TYPE,
     StreamingProtocol,
 )
@@ -74,9 +77,9 @@ class AirPlayPlayer(Player):
         initial_volume: int = FALLBACK_VOLUME,
     ) -> None:
         """Initialize AirPlayPlayer."""
-        super().__init__(provider, player_id)
         self.raop_discovery_info = raop_discovery_info
         self.airplay_discovery_info = airplay_discovery_info
+        super().__init__(provider, player_id)
         self.address = address
         self.stream: RaopStream | AirPlay2Stream | None = None
         self.last_command_sent = 0.0
@@ -91,7 +94,9 @@ class AirPlayPlayer(Player):
             model=model,
             manufacturer=manufacturer,
         )
-        self._attr_device_info.add_identifier(IdentifierType.MAC_ADDRESS, mac_address)
+        # Only add MAC address if it's valid (not 00:00:00:00:00:00)
+        if is_valid_mac_address(mac_address):
+            self._attr_device_info.add_identifier(IdentifierType.MAC_ADDRESS, mac_address)
         self._attr_device_info.add_identifier(IdentifierType.IP_ADDRESS, address)
         self._attr_volume_level = initial_volume
         self._attr_can_group_with = {provider.instance_id}
@@ -243,17 +248,24 @@ class AirPlayPlayer(Player):
 
         return base_entries
 
-    def _requires_pairing(self) -> bool:
-        """Check if this device requires pairing (Apple TV or macOS)."""
-        if self.device_info.manufacturer.lower() != "apple":
-            return False
+    def _get_flags(self) -> int:
+        # Flags are either present via "sf" or "flags. Taken from pyatv.protocols.airplay.utils"
+        if self.airplay_discovery_info:
+            properties = self.airplay_discovery_info.properties
+        elif self.raop_discovery_info:
+            properties = self.raop_discovery_info.properties
+        else:
+            return 0
 
-        model = self.device_info.model
-        # Apple TV devices
-        if "appletv" in model.lower() or "apple tv" in model.lower():
-            return True
-        # Mac devices (including iMac, MacBook, Mac mini, Mac Pro, Mac Studio)
-        return model.startswith(("Mac", "iMac"))
+        flags = properties.get(b"sf") or properties.get(b"flags") or "0x0"
+        return int(flags, 16)
+
+    def _requires_pairing(self) -> bool:
+        """Check if this device requires pairing.
+
+        Adapted from pyatv.protocols.airplay.utils.get_pairing_requirement.
+        """
+        return bool(self._get_flags() & (LEGACY_PAIRING_BIT | PIN_REQUIRED))
 
     def _get_credentials_key(self, protocol: StreamingProtocol) -> str:
         """Get the config key for credentials for given protocol."""

@@ -30,6 +30,7 @@ from pychromecast.controllers.multizone import MultizoneController
 from pychromecast.socket_client import CONNECTION_STATUS_CONNECTED, CONNECTION_STATUS_DISCONNECTED
 
 from music_assistant.constants import MASS_LOGO_ONLINE, VERBOSE_LOG_LEVEL
+from music_assistant.helpers.util import is_valid_mac_address
 from music_assistant.models.player import DeviceInfo, Player, PlayerMedia
 
 from .constants import (
@@ -117,9 +118,11 @@ class ChromecastPlayer(Player):
             manufacturer=self.cast_info.manufacturer or "",
         )
         self._attr_device_info.add_identifier(IdentifierType.IP_ADDRESS, self.cast_info.host)
-        self._attr_device_info.add_identifier(
-            IdentifierType.MAC_ADDRESS, self.cast_info.mac_address
-        )
+        # Only add MAC address if it's valid (not 00:00:00:00:00:00)
+        if is_valid_mac_address(self.cast_info.mac_address):
+            self._attr_device_info.add_identifier(
+                IdentifierType.MAC_ADDRESS, self.cast_info.mac_address
+            )
         self._attr_device_info.add_identifier(IdentifierType.UUID, str(self.cast_info.uuid))
         assert provider.mz_mgr is not None  # for type checking
         status_listener = CastStatusListener(self, provider.mz_mgr)
@@ -422,7 +425,7 @@ class ChromecastPlayer(Player):
                     raise PlayerUnavailableError("Failed to launch Sendspin Cast App")
             else:
                 await self._launch_app()
-            self._attr_active_source = self.player_id
+            self._attr_active_source = None
         else:
             self._attr_active_source = None
             await asyncio.to_thread(self.cc.quit_app)
@@ -722,7 +725,7 @@ class ChromecastPlayer(Player):
         if group_player:
             self._attr_active_source = group_player.active_source or group_player.player_id
         elif self.cc.app_id in (MASS_APP_ID, APP_MEDIA_RECEIVER):
-            self._attr_active_source = self.player_id
+            self._attr_active_source = None
         else:
             app_name = self.cc.app_display_name or "Unknown App"
             app_id = app_name.lower().replace(" ", "_")
@@ -767,7 +770,7 @@ class ChromecastPlayer(Player):
                     child._attr_current_media = self._attr_current_media
                     child._attr_elapsed_time = self._attr_elapsed_time
                     child._attr_elapsed_time_last_updated = self._attr_elapsed_time_last_updated
-                    child._attr_active_source = self._active_source
+                    child._attr_active_source = self.active_source
                     self.mass.loop.call_soon_threadsafe(child.update_state)
         self.mass.loop.call_soon_threadsafe(self.update_state)
 
@@ -799,7 +802,8 @@ class ChromecastPlayer(Player):
             )
             self._attr_device_info.add_identifier(IdentifierType.IP_ADDRESS, self.cast_info.host)
             self._attr_device_info.add_identifier(IdentifierType.UUID, str(self.cast_info.uuid))
-            if self.cast_info.mac_address:
+            # Only add MAC address if it's valid (not 00:00:00:00:00:00)
+            if is_valid_mac_address(self.cast_info.mac_address):
                 self._attr_device_info.add_identifier(
                     IdentifierType.MAC_ADDRESS, self.cast_info.mac_address
                 )

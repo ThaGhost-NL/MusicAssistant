@@ -36,6 +36,7 @@ from music_assistant.constants import (
     create_sample_rates_config_entry,
 )
 from music_assistant.helpers.tags import async_parse_tags
+from music_assistant.helpers.util import is_valid_mac_address
 from music_assistant.models.player import Player
 from music_assistant.providers.sonos.const import (
     PLAYBACK_STATE_MAP,
@@ -140,7 +141,8 @@ class SonosPlayer(Player):
         # Extract MAC address from Sonos player_id (RINCON_XXXXXXXXXXXX01400)
         # The middle part contains the MAC address (last 6 bytes in hex)
         mac_address = self._extract_mac_from_player_id()
-        if mac_address:
+        # Only add MAC address if it's valid (not 00:00:00:00:00:00)
+        if mac_address and is_valid_mac_address(mac_address):
             self._attr_device_info.add_identifier(IdentifierType.MAC_ADDRESS, mac_address)
 
         if SonosCapability.LINE_IN in self.discovery_info["device"]["capabilities"]:
@@ -226,7 +228,7 @@ class SonosPlayer(Player):
         if self.client.player.is_passive:
             self.logger.debug("Ignore PAUSE command: Player is synced to another player.")
             return
-        active_source = self._attr_active_source
+        active_source = self.state.active_source
         if self.mass.player_queues.get(active_source):
             # Sonos seems to be bugged when playing our queue tracks and we send pause,
             # it can't resume the current track and simply aborts/skips it
@@ -524,12 +526,8 @@ class SonosPlayer(Player):
             if SOURCE_SPOTIFY not in [x.id for x in self._attr_source_list]:
                 self._attr_source_list.append(PLAYER_SOURCE_MAP[SOURCE_SPOTIFY])
         elif active_service == MusicService.MUSIC_ASSISTANT:
-            if (object_id := container.get("id", {}).get("objectId")) and object_id.startswith(
-                "mass:"
-            ):
-                self._attr_active_source = object_id.split(":")[1]
-            else:
-                self._attr_active_source = None
+            # setting active source to None is fine
+            self._attr_active_source = None
         # its playing some service we did not yet map
         elif container and container.get("service", {}).get("name"):
             self._attr_active_source = container["service"]["name"]
@@ -619,11 +617,11 @@ class SonosPlayer(Player):
 
         # Workaround for Sonos AirPlay ungrouping bug: when AirPlay playback starts
         # on a Sonos speaker that has native group members, Sonos dissolves the group.
-        # We capture the group state here and restore it via AirPlay protocol after a delay.
+        # We capture the group state here and restore it after a delay.
 
         self.logger.debug(
             "AirPlay playback starting on %s with native group members %s - "
-            "scheduling restoration to avoid Sonos ungrouping bug",
+            "scheduling restoration to work around Sonos ungrouping bug",
             self.name,
             current_members,
         )
@@ -631,11 +629,14 @@ class SonosPlayer(Player):
 
         async def _restore_airplay_group() -> None:
             try:
+                self.logger.info(
+                    "Restoring AirPlay group for %s with members %s",
+                    self.name,
+                    members_to_restore,
+                )
                 # we call set_members on the PlayerController here so it
                 # can try to regroup via the preferred protocol (which may be AirPlay),
-                await self.mass.players.cmd_set_members(
-                    self.player_id, player_ids_to_add=members_to_restore
-                )
+                await self.set_members(player_ids_to_add=members_to_restore)
             except Exception as err:
                 self.logger.warning("Failed to restore AirPlay group: %s", err)
 
