@@ -831,11 +831,24 @@ class MetaDataController(CoreController):
         :param artist_name: Raw artist name to normalize.
         """
         # Business/title suffixes that should not be flipped
-        no_flip_suffixes = ("inc", "inc.", "ltd", "ltd.", "llc", "corp", "the creator")
+        no_flip_suffixes = ("inc", "inc.", "ltd", "ltd.", "llc", "corp")
+        # Specific known bands that are 2 words total and split by a comma
+        valid_artist_names = {
+            "hello, goodbye",
+            "wait, what",
+            "goodnight, sunrise",
+            "slaughter beach, dog",
+            "mount, eerie",
+            "american, native",
+        }
 
         normalized = artist_name.replace("_", " ")
 
         if "," not in normalized:
+            return normalized
+
+        # Check against known artist exceptions first
+        if normalized.lower() in valid_artist_names:
             return normalized
 
         # Don't flip if contains "and" or "&" (e.g., "Crosby, Stills & Nash")
@@ -860,10 +873,6 @@ class MetaDataController(CoreController):
 
         # Don't flip if 2+ words after comma (e.g., "Portugal, The Man")
         if len(after_comma.split()) >= 2:
-            return normalized
-
-        # Don't flip if 2+ words before comma (likely a phrase, e.g., "Hello, Goodbye")
-        if len(before_comma.split()) >= 2:
             return normalized
 
         # Standard flip (e.g., "Squier, Billy" -> "Billy Squier")
