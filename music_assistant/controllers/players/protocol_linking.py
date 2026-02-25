@@ -1205,8 +1205,8 @@ class ProtocolLinkingMixin:
 
         Selection priority when grouping:
         1. Try child's preferred output protocol (from player settings)
-        2. Try native grouping (if parent and child are compatible)
-        3. Try parent's active output protocol (if any and child supports it)
+        2. Try parent's active output protocol (if any and child supports it)
+        3. Try native grouping (if parent and child are compatible)
         4. Search for common protocol that supports set_members
         5. Log warning if no option works
 
@@ -1266,19 +1266,7 @@ class ProtocolLinkingMixin:
                 )
                 continue
 
-            # Priority 2: Try native grouping
-            if self._can_use_native_grouping(
-                child_player, parent_player, parent_supports_native_grouping
-            ):
-                native_members.append(child_player_id)
-                self.logger.log(
-                    VERBOSE_LOG_LEVEL,
-                    "Using native grouping for %s",
-                    child_player.state.name,
-                )
-                continue
-
-            # Priority 3: Try parent's active output protocol (if it supports SET_MEMBERS)
+            # Priority 2: Try parent's active output protocol (if it supports SET_MEMBERS)
             if parent_protocol_domain and parent_protocol_player:
                 # Verify the active protocol supports SET_MEMBERS
                 if PlayerFeature.SET_MEMBERS in parent_protocol_player.state.supported_features:
@@ -1302,6 +1290,18 @@ class ProtocolLinkingMixin:
                     # Clear the parent protocol so Priority 4 can select a new one
                     parent_protocol_player = None
                     parent_protocol_domain = None
+
+            # Priority 3: Try native grouping
+            if self._can_use_native_grouping(
+                child_player, parent_player, parent_supports_native_grouping
+            ):
+                native_members.append(child_player_id)
+                self.logger.log(
+                    VERBOSE_LOG_LEVEL,
+                    "Using native grouping for %s",
+                    child_player.state.name,
+                )
+                continue
 
             # Priority 4: Search for common protocol that supports set_members
             parent_protocol, child_protocol = self._try_find_common_protocol(
@@ -1442,7 +1442,7 @@ class ProtocolLinkingMixin:
                     parent_protocol_player.provider.domain,
                 )
                 # Use resume to restart from current position
-                await self.mass.players.cmd_resume(parent_player.player_id)
+                await self.mass.players._handle_cmd_resume(parent_player.player_id)
 
         self.logger.debug(
             "After set_members, protocol player %s state: group_members=%s, synced_to=%s",
@@ -1450,30 +1450,3 @@ class ProtocolLinkingMixin:
             parent_protocol_player.group_members,
             parent_protocol_player.synced_to,
         )
-
-        # Clear active protocol if all protocol members were removed
-        if (
-            filtered_protocol_remove
-            and not filtered_protocol_add
-            and parent_protocol_player.player_id == parent_player.active_output_protocol
-        ):
-            # Check group_members count to see if we should clear
-            members_count = len(parent_protocol_player.group_members)
-            self.logger.debug(
-                "Checking if should clear active protocol on %s: "
-                "protocol_members_count=%s, removing=%s",
-                parent_player.state.name,
-                members_count,
-                filtered_protocol_remove,
-            )
-            if members_count <= 1 and parent_player.state.playback_state == PlaybackState.IDLE:
-                parent_player.set_active_output_protocol(None)
-
-        # Clear active output protocol on removed child players
-        if filtered_protocol_remove:
-            for child_protocol_id in filtered_protocol_remove:
-                if child_protocol := self.get_player(child_protocol_id):
-                    if child_protocol.protocol_parent_id:
-                        if child_player := self.get_player(child_protocol.protocol_parent_id):
-                            if child_player.active_output_protocol == child_protocol_id:
-                                child_player.set_active_output_protocol(None)
