@@ -823,8 +823,11 @@ async def resolve_radio_stream(mass: MusicAssistant, url: str) -> tuple[str, Str
         if TYPE_CHECKING:  # for type checking
             cache = cast("tuple[str, str]", cache)
         return (cache[0], StreamType(cache[1]))
+
     stream_type = StreamType.HTTP
+    resolved_url = url
     timeout = ClientTimeout(total=None, connect=10, sock_read=5)
+
     try:
         async with mass.http_session_no_ssl.get(
             url, headers=HTTP_HEADERS_ICY, allow_redirects=True, timeout=timeout
@@ -833,8 +836,10 @@ async def resolve_radio_stream(mass: MusicAssistant, url: str) -> tuple[str, Str
             resp.raise_for_status()
             if not resp.headers:
                 raise InvalidDataError("no headers found")
+
         if headers.get("icy-metaint") is not None:
             stream_type = StreamType.ICY
+
         if (
             url.endswith((".m3u", ".m3u8", ".pls"))
             or ".m3u?" in url
@@ -855,15 +860,43 @@ async def resolve_radio_stream(mass: MusicAssistant, url: str) -> tuple[str, Str
                     raise InvalidDataError("No content found in playlist")
             except IsHLSPlaylist:
                 stream_type = StreamType.HLS
+
     except TimeoutError as err:
         LOGGER.warning("Timeout while parsing radio URL %s", url)
         raise InvalidDataError(f"Timeout connecting to {url}") from err
+
     except aiohttp.ClientError as err:
-        # Check if this is a malformed HTTP response that ffmpeg might still handle
+        # Check if this is a Shoutcast/ICY response that aiohttp can't parse
         if isinstance(err, aiohttp.ClientResponseError):
             err_msg = str(err)
-            if "HTTP/1." in err_msg or err.status >= 400:
-                # Malformed HTTP (wrong line endings, etc) - let ffmpeg try
+
+            # Check for ICY response first - this indicates Shoutcast
+            if "ICY" in err_msg.upper():
+                LOGGER.debug("ICY response detected for %s, validating Shoutcast stream", url)
+                if await _validate_shoutcast_stream(url):
+                    result = (url, StreamType.SHOUTCAST)
+                    await mass.cache.set(
+                        url,
+                        result,
+                        expiration=3600 * 3,
+                        provider=CACHE_PROVIDER,
+                        category=CACHE_CATEGORY_RESOLVED_RADIO_URL,
+                    )
+                    return result
+                # Validation failed but ICY detected - still try as HTTP
+                LOGGER.warning("ICY response detected but Shoutcast validation failed for %s", url)
+                result = (url, stream_type)
+                await mass.cache.set(
+                    url,
+                    result,
+                    expiration=3600 * 3,
+                    provider=CACHE_PROVIDER,
+                    category=CACHE_CATEGORY_RESOLVED_RADIO_URL,
+                )
+                return result
+
+            # Check for malformed HTTP (wrong line endings, etc.)
+            if "HTTP/1." in err_msg:
                 LOGGER.warning("Malformed HTTP response from %s, attempting direct stream", url)
                 result = (url, stream_type)
                 await mass.cache.set(
@@ -875,10 +908,22 @@ async def resolve_radio_stream(mass: MusicAssistant, url: str) -> tuple[str, Str
                 )
                 return result
 
-        # Might be Shoutcast - check it
+            # Check if it's a real HTTP error (has status >= 400)
+            if hasattr(err, "status") and err.status >= 400:
+                LOGGER.warning("HTTP error %d from %s, attempting direct stream", err.status, url)
+                result = (url, stream_type)
+                await mass.cache.set(
+                    url,
+                    result,
+                    expiration=3600 * 3,
+                    provider=CACHE_PROVIDER,
+                    category=CACHE_CATEGORY_RESOLVED_RADIO_URL,
+                )
+                return result
+
+        # Other aiohttp errors - might still be Shoutcast, check it
         LOGGER.debug("aiohttp error for %s, checking if legacy Shoutcast stream", url)
         if await _validate_shoutcast_stream(url):
-            # Shoutcast stream confirmed - cache and return immediately
             result = (url, StreamType.SHOUTCAST)
             await mass.cache.set(
                 url,
@@ -890,7 +935,7 @@ async def resolve_radio_stream(mass: MusicAssistant, url: str) -> tuple[str, Str
             return result
 
         # Unknown error - still try to stream
-        LOGGER.warning("Failed to parse radio URL %s, attempting direct stream", url)
+        LOGGER.warning("Failed to parse radio URL %s: %s - attempting direct stream", url, str(err))
         result = (url, stream_type)
         await mass.cache.set(
             url,
@@ -900,6 +945,17 @@ async def resolve_radio_stream(mass: MusicAssistant, url: str) -> tuple[str, Str
             category=CACHE_CATEGORY_RESOLVED_RADIO_URL,
         )
         return result
+
+    # Cache and return the resolved stream
+    result = (resolved_url, stream_type)
+    await mass.cache.set(
+        url,
+        result,
+        expiration=3600 * 3,
+        provider=CACHE_PROVIDER,
+        category=CACHE_CATEGORY_RESOLVED_RADIO_URL,
+    )
+    return result
 
 
 async def _validate_shoutcast_stream(url: str) -> bool:
