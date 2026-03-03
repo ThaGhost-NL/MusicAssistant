@@ -855,13 +855,27 @@ async def resolve_radio_stream(mass: MusicAssistant, url: str) -> tuple[str, Str
                     raise InvalidDataError("No content found in playlist")
             except IsHLSPlaylist:
                 stream_type = StreamType.HLS
-
     except TimeoutError as err:
         LOGGER.warning("Timeout while parsing radio URL %s", url)
         raise InvalidDataError(f"Timeout connecting to {url}") from err
-    except aiohttp.ClientError:
-        # This catches connection errors, parse errors, AND ClientResponseError
-        # Try to determine if it's a Shoutcast stream
+    except aiohttp.ClientError as err:
+        # Check if this is a malformed HTTP response that ffmpeg might still handle
+        if isinstance(err, aiohttp.ClientResponseError):
+            err_msg = str(err)
+            if "HTTP/1." in err_msg or err.status >= 400:
+                # Malformed HTTP (wrong line endings, etc) - let ffmpeg try
+                LOGGER.warning("Malformed HTTP response from %s, attempting direct stream", url)
+                result = (url, stream_type)
+                await mass.cache.set(
+                    url,
+                    result,
+                    expiration=3600 * 3,
+                    provider=CACHE_PROVIDER,
+                    category=CACHE_CATEGORY_RESOLVED_RADIO_URL,
+                )
+                return result
+
+        # Might be Shoutcast - check it
         LOGGER.debug("aiohttp error for %s, checking if legacy Shoutcast stream", url)
         if await _validate_shoutcast_stream(url):
             # Shoutcast stream confirmed - cache and return immediately
@@ -874,20 +888,18 @@ async def resolve_radio_stream(mass: MusicAssistant, url: str) -> tuple[str, Str
                 category=CACHE_CATEGORY_RESOLVED_RADIO_URL,
             )
             return result
-        # Not a Shoutcast stream, re-raise the original error
-        LOGGER.warning("Failed to connect to or parse radio URL %s", url)
-        raise
 
-    result = (url, stream_type)
-    cache_expiration = 3600 * 3
-    await mass.cache.set(
-        url,
-        result,
-        expiration=cache_expiration,
-        provider=CACHE_PROVIDER,
-        category=CACHE_CATEGORY_RESOLVED_RADIO_URL,
-    )
-    return result
+        # Unknown error - still try to stream
+        LOGGER.warning("Failed to parse radio URL %s, attempting direct stream", url)
+        result = (url, stream_type)
+        await mass.cache.set(
+            url,
+            result,
+            expiration=3600 * 3,
+            provider=CACHE_PROVIDER,
+            category=CACHE_CATEGORY_RESOLVED_RADIO_URL,
+        )
+        return result
 
 
 async def _validate_shoutcast_stream(url: str) -> bool:
