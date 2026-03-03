@@ -43,6 +43,7 @@ class JWTHelper:
         token_name: str,
         expires_at: datetime,
         is_long_lived: bool = False,
+        provider_name: str | None = None,
     ) -> str:
         """Encode a JWT token for a user.
 
@@ -51,6 +52,7 @@ class JWTHelper:
         :param token_name: Human-readable token name.
         :param expires_at: Token expiration datetime.
         :param is_long_lived: Whether this is a long-lived token.
+        :param provider_name: Optional provider name that created this token (e.g., "party_mode").
         :return: Encoded JWT token string.
         """
         now = utc()
@@ -65,6 +67,9 @@ class JWTHelper:
             "is_long_lived": is_long_lived,
         }
 
+        if provider_name:
+            payload["provider_name"] = provider_name
+
         return jwt.encode(payload, self.secret_key, algorithm=self.algorithm)
 
     def decode_token(self, token: str, verify_exp: bool = True) -> dict[str, Any]:
@@ -75,12 +80,11 @@ class JWTHelper:
         :return: Decoded token payload.
         :raises jwt.InvalidTokenError: If token is invalid or expired.
         """
-        options = {"verify_exp": verify_exp}
         payload: dict[str, Any] = jwt.decode(
             token,
             self.secret_key,
             algorithms=[self.algorithm],
-            options=options,
+            options={"verify_exp": verify_exp},
         )
         return payload
 

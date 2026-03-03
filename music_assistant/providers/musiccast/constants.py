@@ -1,9 +1,13 @@
 """Constants for the MusicCast provider."""
 
-from music_assistant_models.config_entries import ConfigEntry
+from aiomusiccast.capabilities import BinarySensor as MCBinarySensor
+from aiomusiccast.capabilities import BinarySetter as MCBinarySetter
+from aiomusiccast.capabilities import NumberSensor as MCNumberSensor
+from aiomusiccast.capabilities import NumberSetter as MCNumberSetter
+from aiomusiccast.capabilities import OptionSetter as MCOptionSetter
+from aiomusiccast.capabilities import TextSensor as MCTextSensor
 
 from music_assistant.constants import (
-    CONF_ENTRY_FLOW_MODE,
     CONF_ENTRY_HTTP_PROFILE_DEFAULT_2,
     CONF_ENTRY_ICY_METADATA_HIDDEN_DISABLED,
     create_sample_rates_config_entry,
@@ -11,18 +15,9 @@ from music_assistant.constants import (
 
 # Constants for players
 # both the http profile and icy didn't matter for me testing it.
-CONF_ENTRY_FLOW_MODE_HIDDEN_DISABLED = ConfigEntry.from_dict(
-    {
-        **CONF_ENTRY_FLOW_MODE.to_dict(),
-        "default_value": False,
-        "value": False,
-        "hidden": True,
-    }
-)
 PLAYER_CONFIG_ENTRIES = [
     CONF_ENTRY_HTTP_PROFILE_DEFAULT_2,
     CONF_ENTRY_ICY_METADATA_HIDDEN_DISABLED,
-    CONF_ENTRY_FLOW_MODE_HIDDEN_DISABLED,
     create_sample_rates_config_entry(max_sample_rate=192000, max_bit_depth=24),
 ]
 # player id is {device_id}{ZONE_SPLITTER}{zone_name}
@@ -80,4 +75,22 @@ MC_CONTROL_SOURCE_IDS = MC_NETUSB_SOURCE_IDS
 MC_CONTROL_SOURCE_IDS.append(
     # tuner can be controlled, will change the station
     "tuner",
+)
+
+# for most sound modes we can just split at '_' and capitalize
+# here are some exceptions:
+MC_SOUND_MODE_FRIENDLY_NAMES = {
+    "2ch_stereo": "2 Channel Stereo",
+    "all_ch_stereo": "All Channels Stereo",
+    "surr_decoder": "Surround Decoder",
+}
+
+# We translate aiomusiccast's capabilities to PlayerOptions
+MC_CAPABILITIES = (
+    MCBinarySensor
+    | MCBinarySetter
+    | MCNumberSensor
+    | MCNumberSetter
+    | MCTextSensor
+    | MCOptionSetter
 )

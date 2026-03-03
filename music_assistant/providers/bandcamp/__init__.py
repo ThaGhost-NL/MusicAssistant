@@ -10,11 +10,12 @@ from bandcamp_async_api import (
     BandcampAPIError,
     BandcampMustBeLoggedInError,
     BandcampNotFoundError,
+    BandcampRateLimitError,
     SearchResultAlbum,
     SearchResultArtist,
     SearchResultTrack,
 )
-from bandcamp_async_api.models import CollectionType
+from bandcamp_async_api.models import BCAlbum, BCTrack, CollectionType
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueType, ProviderConfig
 from music_assistant_models.enums import (
     ConfigEntryType,
@@ -26,14 +27,9 @@ from music_assistant_models.errors import (
     InvalidDataError,
     LoginFailed,
     MediaNotFoundError,
+    ResourceTemporarilyUnavailable,
 )
-from music_assistant_models.media_items import (
-    Album,
-    Artist,
-    AudioFormat,
-    SearchResults,
-    Track,
-)
+from music_assistant_models.media_items import Album, Artist, AudioFormat, SearchResults, Track
 from music_assistant_models.provider import ProviderManifest
 from music_assistant_models.streamdetails import StreamDetails
 
@@ -93,17 +89,24 @@ async def get_config_entries(
             description="Search limit while getting artist top tracks.",
             value=values.get(CONF_TOP_TRACKS_LIMIT) if values else DEFAULT_TOP_TRACKS_LIMIT,
             default_value=DEFAULT_TOP_TRACKS_LIMIT,
-            category="advanced",
+            advanced=True,
         ),
     )
 
 
-def split_id(id_: str) -> tuple[int, int | None, int | None]:
-    """Return (artist_id, album_id, track_id). Missing parts are returned as 0."""
-    parts = id_.split("-")
-    part_0 = int(parts[0])
-    part_1 = int(parts[1]) if len(parts) > 1 else 0
-    part_2 = int(parts[2]) if len(parts) > 2 else 0
+def split_id(id_: str) -> tuple[int, int, int]:
+    """Return (artist_id, album_id, track_id). Missing parts are returned as 0.
+
+    :param id_: Compound ID string, e.g. "123-456-789".
+    :raises InvalidDataError: If the ID contains non-numeric parts.
+    """
+    try:
+        parts = id_.split("-")
+        part_0 = int(parts[0])
+        part_1 = int(parts[1]) if len(parts) > 1 else 0
+        part_2 = int(parts[2]) if len(parts) > 2 else 0
+    except (ValueError, IndexError) as error:
+        raise InvalidDataError(f"Malformed Bandcamp ID: {id_}") from error
     return part_0, part_1, part_2
 
 
@@ -112,7 +115,12 @@ class BandcampProvider(MusicProvider):
 
     _client: BandcampAPIClient
     _converters: BandcampConverters
-    throttler: ThrottlerManager
+    throttler: ThrottlerManager = ThrottlerManager(
+        rate_limit=50,  # requests per period seconds
+        period=10,
+        initial_backoff=3,  # Bandcamp responds with Retry-After 3
+        retry_attempts=10,
+    )
     top_tracks_limit: int
 
     async def handle_async_init(self) -> None:
@@ -121,12 +129,25 @@ class BandcampProvider(MusicProvider):
         self.top_tracks_limit = cast(
             "int", self.config.get_value(CONF_TOP_TRACKS_LIMIT, DEFAULT_TOP_TRACKS_LIMIT)
         )
-
-        # Initialize the new async API client
-        self._client = BandcampAPIClient(session=self.mass.http_session, identity_token=identity)
-
-        self.throttler = ThrottlerManager(rate_limit=1, period=2)
+        self._client = BandcampAPIClient(
+            session=self.mass.http_session,
+            identity_token=identity,
+            default_retry_after=3,  # Bandcamp responds with Retry-After 3
+        )
         self._converters = BandcampConverters(self.domain, self.instance_id)
+
+        # The provider can function without login (search and streaming),
+        # but if credentials were explicitly configured, validate them now.
+        # A bad login fails hard so the user can fix it immediately;
+        # transient errors (rate limits, network) are logged and the provider
+        # continues since the login may still be valid.
+        if identity:
+            try:
+                await self._client.get_collection_summary()
+            except BandcampMustBeLoggedInError as error:
+                raise LoginFailed("Bandcamp login is invalid or expired.") from error
+            except BandcampAPIError as error:
+                self.logger.warning("Could not validate Bandcamp login: %s", error)
 
     @property
     def is_streaming_provider(self) -> bool:
@@ -140,9 +161,6 @@ class BandcampProvider(MusicProvider):
     ) -> SearchResults:
         """Perform search on music provider."""
         results = SearchResults()
-        if not self._client.identity:
-            return results
-
         if not media_types:
             return results
 
@@ -150,6 +168,10 @@ class BandcampProvider(MusicProvider):
             search_results = await self._client.search(search_query)
         except BandcampNotFoundError as error:
             raise MediaNotFoundError("No results for Bandcamp search") from error
+        except BandcampRateLimitError as error:
+            raise ResourceTemporarilyUnavailable(
+                "Bandcamp rate limit reached", backoff_time=error.retry_after
+            ) from error
         except BandcampAPIError as error:
             raise InvalidDataError("Unexpected error during Bandcamp search") from error
 
@@ -173,7 +195,8 @@ class BandcampProvider(MusicProvider):
             return
 
         try:
-            collection = await self._client.get_collection_items(CollectionType.COLLECTION)
+            async with self.throttler.acquire():  # AsyncGenerator method cannot be decorated
+                collection = await self._client.get_collection_items(CollectionType.COLLECTION)
             band_ids = set()
             for item in collection.items:
                 if item.item_type == "band":
@@ -190,6 +213,10 @@ class BandcampProvider(MusicProvider):
             raise LoginFailed("Wrong Bandcamp identity token.") from error
         except BandcampNotFoundError as error:
             raise MediaNotFoundError("Bandcamp library artists returned no results") from error
+        except BandcampRateLimitError as error:
+            raise ResourceTemporarilyUnavailable(
+                "Bandcamp rate limit reached", backoff_time=error.retry_after
+            ) from error
         except BandcampAPIError as error:
             raise MediaNotFoundError("Failed to get library artists") from error
 
@@ -199,7 +226,8 @@ class BandcampProvider(MusicProvider):
             return
 
         try:
-            api_collection = await self._client.get_collection_items(CollectionType.COLLECTION)
+            async with self.throttler.acquire():  # AsyncGenerator method cannot be decorated
+                api_collection = await self._client.get_collection_items(CollectionType.COLLECTION)
             for item in api_collection.items:
                 if item.item_type == "album":
                     yield await self.get_album(f"{item.band_id}-{item.item_id}")
@@ -209,6 +237,10 @@ class BandcampProvider(MusicProvider):
             raise LoginFailed("Wrong Bandcamp identity token.") from error
         except BandcampNotFoundError as error:
             raise MediaNotFoundError("Bandcamp library albums returned no results") from error
+        except BandcampRateLimitError as error:
+            raise ResourceTemporarilyUnavailable(
+                "Bandcamp rate limit reached", backoff_time=error.retry_after
+            ) from error
         except BandcampAPIError as error:
             raise MediaNotFoundError("Failed to get library albums") from error
 
@@ -217,34 +249,30 @@ class BandcampProvider(MusicProvider):
         if not self._client.identity:  # library requires identity
             return
 
-        try:
-            async for album in self.get_library_albums():
-                tracks = await self.get_album_tracks(album.item_id)
-                for track in tracks:
-                    yield track
-                    await asyncio.sleep(0)  # Yield control to avoid blocking
-        except BandcampMustBeLoggedInError as error:
-            self.logger.error("Error getting Bandcamp library tracks: Wrong identity token.")
-            raise LoginFailed("Wrong Bandcamp identity token.") from error
-        except BandcampNotFoundError as error:
-            raise MediaNotFoundError("Bandcamp library tracks returned no results") from error
-        except BandcampAPIError as error:
-            raise MediaNotFoundError("Failed to get library tracks") from error
+        async for album in self.get_library_albums():
+            tracks = await self.get_album_tracks(album.item_id)
+            for track in tracks:
+                yield track
+                await asyncio.sleep(0)  # Yield control to avoid blocking
 
     @use_cache(CACHE)
+    @throttle_with_retries
     async def get_artist(self, prov_artist_id: str | int) -> Artist:
         """Get full artist details by id."""
         try:
             api_artist = await self._client.get_artist(prov_artist_id)
             return self._converters.artist_from_api(api_artist)
         except BandcampNotFoundError as error:
-            raise MediaNotFoundError(
-                f"Bandcamp artist {prov_artist_id} search returned no results"
+            raise MediaNotFoundError(f"Artist {prov_artist_id} not found on Bandcamp") from error
+        except BandcampRateLimitError as error:
+            raise ResourceTemporarilyUnavailable(
+                "Bandcamp rate limit reached", backoff_time=error.retry_after
             ) from error
         except BandcampAPIError as error:
             raise MediaNotFoundError(f"Failed to get artist {prov_artist_id}") from error
 
     @use_cache(CACHE)
+    @throttle_with_retries
     async def get_album(self, prov_album_id: str) -> Album:
         """Get full album details by id."""
         artist_id, album_id, _ = split_id(prov_album_id)
@@ -252,46 +280,66 @@ class BandcampProvider(MusicProvider):
             api_album = await self._client.get_album(artist_id, album_id)
             return self._converters.album_from_api(api_album)
         except BandcampNotFoundError as error:
-            raise MediaNotFoundError(
-                f"Bandcamp album {prov_album_id} search returned no results"
+            raise MediaNotFoundError(f"Album {prov_album_id} not found on Bandcamp") from error
+        except BandcampRateLimitError as error:
+            raise ResourceTemporarilyUnavailable(
+                "Bandcamp rate limit reached", backoff_time=error.retry_after
             ) from error
         except BandcampAPIError as error:
             raise MediaNotFoundError(f"Failed to get album {prov_album_id}") from error
 
+    @throttle_with_retries
+    async def _fetch_api_track(self, item_id: str) -> tuple[BCTrack, BCAlbum | None]:
+        """Fetch a raw API track and its parent album by compound item ID.
+
+        Uses get_album when album_id is present (most tracks), falling back
+        to get_track for standalone tracks (album_id=0).
+
+        :param item_id: Compound track ID in the form artist_id-album_id-track_id.
+        """
+        artist_id, album_id, track_id = split_id(item_id)
+        if not track_id:
+            album_id, track_id = 0, album_id
+
+        try:
+            if album_id:
+                api_album = await self._client.get_album(artist_id, album_id)
+                api_track = next((t for t in api_album.tracks if t.id == track_id), None)
+                if not api_track:
+                    raise MediaNotFoundError(f"Track {item_id} not found in album on Bandcamp")
+                return api_track, api_album
+            return await self._client.get_track(artist_id, track_id), None
+        except BandcampMustBeLoggedInError as error:
+            raise LoginFailed("Bandcamp login is invalid or expired.") from error
+        except BandcampNotFoundError as error:
+            raise MediaNotFoundError(f"Track {item_id} not found on Bandcamp") from error
+        except BandcampRateLimitError as error:
+            raise ResourceTemporarilyUnavailable(
+                "Bandcamp rate limit reached", backoff_time=error.retry_after
+            ) from error
+        except BandcampAPIError as error:
+            raise MediaNotFoundError(f"Failed to get track {item_id}") from error
+
     @use_cache(CACHE)
     async def get_track(self, prov_track_id: str) -> Track:
         """Get full track details by id."""
-        artist_id, album_id, track_id = split_id(prov_track_id)
-        if track_id is None:  # artist_id-track_id
-            album_id, track_id = None, album_id
-
-        try:
-            if all((artist_id, album_id, track_id)):
-                api_album = await self._client.get_album(artist_id, album_id)
-                api_track = next((_ for _ in api_album.tracks if _.id == track_id), None)
-                return self._converters.track_from_api(
-                    track=api_track,
-                    album_id=api_album.id,
-                    album_name=api_album.title,
-                    album_image_url=api_album.art_url,
-                )
-            if not album_id:
-                api_track = await self._client.get_track(artist_id, track_id)
-                return self._converters.track_from_api(
-                    track=api_track,
-                    album_id=api_track.album.id if api_track.album else None,
-                    album_name=api_track.album.title if api_track.album else "",
-                    album_image_url=api_track.album.art_url if api_track.album else "",
-                )
-            raise MediaNotFoundError(f"Track {prov_track_id} not found on Bandcamp")
-        except BandcampNotFoundError as error:
-            raise MediaNotFoundError(
-                f"Bandcamp track {prov_track_id} search returned no results"
-            ) from error
-        except BandcampAPIError as error:
-            raise MediaNotFoundError(f"Failed to get track {prov_track_id}") from error
+        api_track, api_album = await self._fetch_api_track(prov_track_id)
+        if api_album:
+            return self._converters.track_from_api(
+                track=api_track,
+                album_id=api_album.id,
+                album_name=api_album.title,
+                album_image_url=api_album.art_url,
+            )
+        return self._converters.track_from_api(
+            track=api_track,
+            album_id=api_track.album.id if api_track.album else None,
+            album_name=api_track.album.title if api_track.album else "",
+            album_image_url=api_track.album.art_url if api_track.album else "",
+        )
 
     @use_cache(CACHE)
+    @throttle_with_retries
     async def get_album_tracks(self, prov_album_id: str) -> list[Track]:
         """Get all tracks in an album."""
         artist_id, album_id, _ = split_id(prov_album_id)
@@ -313,12 +361,17 @@ class BandcampProvider(MusicProvider):
 
         except BandcampNotFoundError as error:
             raise MediaNotFoundError(
-                f"Bandcamp album {prov_album_id} tracks search returned no results"
+                f"Album tracks for {prov_album_id} not found on Bandcamp"
+            ) from error
+        except BandcampRateLimitError as error:
+            raise ResourceTemporarilyUnavailable(
+                "Bandcamp rate limit reached", backoff_time=error.retry_after
             ) from error
         except BandcampAPIError as error:
             raise MediaNotFoundError(f"Failed to get albums tracks for {prov_album_id}") from error
 
     @use_cache(CACHE)
+    @throttle_with_retries
     async def get_artist_albums(self, prov_artist_id: str) -> list[Album]:
         """Get albums by an artist."""
         albums = []
@@ -339,7 +392,11 @@ class BandcampProvider(MusicProvider):
 
         except BandcampNotFoundError as error:
             raise MediaNotFoundError(
-                f"Bandcamp artist {prov_artist_id} albums search returned no results"
+                f"Artist {prov_artist_id} albums not found on Bandcamp"
+            ) from error
+        except BandcampRateLimitError as error:
+            raise ResourceTemporarilyUnavailable(
+                "Bandcamp rate limit reached", backoff_time=error.retry_after
             ) from error
         except BandcampAPIError as error:
             raise MediaNotFoundError(f"Failed to get albums for artist {prov_artist_id}") from error
@@ -347,67 +404,43 @@ class BandcampProvider(MusicProvider):
         return albums
 
     @use_cache(CACHE)
+    @throttle_with_retries
     async def get_artist_toptracks(self, prov_artist_id: str) -> list[Track]:
         """Get top tracks of an artist."""
         tracks: list[Track] = []
-        try:
-            albums = await self.get_artist_albums(prov_artist_id)
-            albums.sort(key=lambda album: (album.year is None, album.year or 0), reverse=True)
-            for album in albums:
-                tracks.extend(await self.get_album_tracks(album.item_id))
-                if len(tracks) >= self.top_tracks_limit:
-                    break
-
-        except BandcampNotFoundError as error:
-            raise MediaNotFoundError(
-                f"Bandcamp artist {prov_artist_id} top tracks search returned no results"
-            ) from error
-
-        except BandcampAPIError as error:
-            raise MediaNotFoundError(
-                f"Failed to get toptracks for artist {prov_artist_id}"
-            ) from error
+        # get_artist_albums and get_album_tracks already handle exceptions and rate limiting
+        albums = await self.get_artist_albums(prov_artist_id)
+        albums.sort(key=lambda album: (album.year is None, album.year or 0), reverse=True)
+        for album in albums:
+            tracks.extend(await self.get_album_tracks(album.item_id))
+            if len(tracks) >= self.top_tracks_limit:
+                break
 
         return tracks[: self.top_tracks_limit]
 
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
-        """Return the content details for the given track."""
-        try:
-            # consider _client to avoid caching if the track urls become dynamic
-            track_ma = await self.get_track(item_id)
-            if not track_ma.metadata.links:
-                raise MediaNotFoundError(
-                    f"No streaming links found for track {item_id}. Please report this"
-                )
+        """Return the content details for the given track.
 
-            link = next(iter(track_ma.metadata.links))
-            if not link:
-                raise MediaNotFoundError(
-                    f"No streaming URL found for track {item_id}. Please report this"
-                )
+        Fetches fresh from the Bandcamp API since streaming URLs may expire.
+        """
+        api_track, _ = await self._fetch_api_track(item_id)
 
-            streaming_url = link.url
-            if not streaming_url:
-                raise MediaNotFoundError(
-                    f"No streaming URL found for track {item_id}: {streaming_url}"
-                )
+        streaming_url, bitrate, content_type = self._converters.streaming_url_from_api(
+            api_track.streaming_url or {}
+        )
+        if not streaming_url:
+            raise MediaNotFoundError(f"No streaming URL found for track {item_id}")
 
-            return StreamDetails(
-                item_id=item_id,
-                provider=self.instance_id,
-                audio_format=AudioFormat(),
-                stream_type=StreamType.HTTP,
-                media_type=media_type,
-                path=streaming_url,
-                can_seek=True,
-                allow_seek=True,
-            )
-
-        except BandcampNotFoundError as error:
-            raise MediaNotFoundError(
-                f"Bandcamp stream details search for {media_type} {item_id} returned no results"
-            ) from error
-        except BandcampAPIError as error:
-            raise MediaNotFoundError(
-                f"Stream details not available for {media_type} {item_id}"
-            ) from error
+        return StreamDetails(
+            item_id=item_id,
+            provider=self.instance_id,
+            audio_format=AudioFormat(
+                content_type=content_type,
+                bit_rate=bitrate,
+            ),
+            stream_type=StreamType.HTTP,
+            media_type=media_type,
+            path=streaming_url,
+            can_seek=True,
+            allow_seek=True,
+        )
