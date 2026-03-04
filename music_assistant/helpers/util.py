@@ -119,7 +119,6 @@ WITH_TITLE_WORDS = (
 )
 
 # Keywords for aggressive search cleaning (includes featuring).
-# Based on genius_lyrics helper pattern, expanded with additional keywords.
 _SEARCH_KEYWORDS = (
     r"remaster(?:ed)?|anniversary|instrumental|live|edit(?:ion)?|single(?:s)?|"
     r"stereo|album|radio|version|feat(?:uring)?|ft|mix|bonus|video|extended|"
@@ -135,7 +134,6 @@ _SEARCH_HYPHEN_PATTERN = re.compile(
 )
 
 # Featuring patterns for stripping from titles (not in parentheses).
-# Examples: "Song Feat. Artist" -> "Song", "Song ft. Someone" -> "Song"
 _FEATURING_PATTERNS = (
     " featuring ",
     " feat. ",
@@ -144,7 +142,7 @@ _FEATURING_PATTERNS = (
     " ft ",
 )
 
-# Suffixes to strip for display purposes only (minimal, obvious junk).
+# Suffixes to strip for display purposes only.
 _DISPLAY_SUFFIXES = (
     "[Lyric Video]",
     "[Official Video]",
@@ -191,9 +189,8 @@ def clean_title_for_search(title: str) -> str:
 def clean_title_for_display(title: str) -> str:
     """Remove video-related suffixes from a song title for display.
 
-    Performs minimal cleaning, removing only video platform artifacts
-    such as "[Lyric Video]" or "[Official Video]". Preserves featuring
-    credits and version information that may be relevant to the user.
+    Performs minimal cleaning, removing only obvious artifacts.
+    Preserves featuring credits and version information that may be relevant to the user.
 
     :param title: The song title to clean.
     """
