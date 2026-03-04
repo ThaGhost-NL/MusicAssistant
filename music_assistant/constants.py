@@ -1,8 +1,9 @@
 """All constants for Music Assistant."""
 
+import json
 import pathlib
 from copy import deepcopy
-from typing import Final, cast
+from typing import Any, Final, cast
 
 from music_assistant_models.config_entries import (
     MULTI_VALUE_SPLITTER,
@@ -25,8 +26,16 @@ PLAYLIST_MEDIA_TYPES: Final[tuple[MediaType, ...]] = (
     MediaType.AUDIOBOOK,
 )
 
+# API_SCHEMA_VERSION: bump this when adding new features to the API commands (and models)
+# or small non-breaking changes to existing commands
+API_SCHEMA_VERSION: Final[int] = 29
 
-API_SCHEMA_VERSION: Final[int] = 28
+# MIN_SCHEMA_VERSION is the minimum API schema version that the current server
+# version can work with. Only bump when there are breaking changes to existing
+# API commands or models, such as removing fields or changing field types.
+# Note that doing so will break compatibility with all clients in the field
+# (including Home Assistant) that have not yet been updated to the new API
+# schema version, so only bump this when absolutely necessary.
 MIN_SCHEMA_VERSION: Final[int] = 28
 
 
@@ -44,6 +53,8 @@ VARIOUS_ARTISTS_MBID: Final[str] = "89ad4ac3-39f7-470e-963a-56509c546377"
 RESOURCES_DIR: Final[pathlib.Path] = (
     pathlib.Path(__file__).parent.resolve().joinpath("helpers/resources")
 )
+GENRE_ICONS_DIR: Final[pathlib.Path] = RESOURCES_DIR.joinpath("genres")
+GENRE_MAPPING_FILE: Final[pathlib.Path] = GENRE_ICONS_DIR.joinpath("genre_mapping.json")
 
 ANNOUNCE_ALERT_FILE: Final[str] = str(RESOURCES_DIR.joinpath("announce.mp3"))
 SILENCE_FILE: Final[str] = str(RESOURCES_DIR.joinpath("silence.mp3"))
@@ -103,12 +114,12 @@ CONF_POWER_CONTROL: Final[str] = "power_control"
 CONF_VOLUME_CONTROL: Final[str] = "volume_control"
 CONF_MUTE_CONTROL: Final[str] = "mute_control"
 CONF_PREFERRED_OUTPUT_PROTOCOL: Final[str] = "preferred_output_protocol"
-CONF_LINKED_PROTOCOL_PLAYER_IDS: Final[str] = (
-    "linked_protocol_player_ids"  # cached for fast restart
-)
+CONF_LINKED_PROTOCOL_IDS: Final[str] = "linked_protocol_ids"  # cached for fast restart
 CONF_PROTOCOL_PARENT_ID: Final[str] = (
     "protocol_parent_id"  # cached native player ID for protocol player
 )
+CONF_CACHED_ARP_MAC: Final[str] = "cached_arp_mac"  # cached ARP-resolved MAC for fast restart
+CONF_REPORTED_MAC: Final[str] = "reported_mac"  # original MAC reported by provider (before ARP)
 CONF_OUTPUT_CODEC: Final[str] = "output_codec"
 CONF_ALLOW_AUDIO_CACHE: Final[str] = "allow_audio_cache"
 CONF_SMART_FADES_MODE: Final[str] = "smart_fades_mode"
@@ -146,6 +157,47 @@ DB_TABLE_TRACK_ARTISTS: Final[str] = "track_artists"
 DB_TABLE_ALBUM_ARTISTS: Final[str] = "album_artists"
 DB_TABLE_LOUDNESS_MEASUREMENTS: Final[str] = "loudness_measurements"
 DB_TABLE_SMART_FADES_ANALYSIS: Final[str] = "smart_fades_analysis"
+DB_TABLE_GENRES: Final[str] = "genres"
+DB_TABLE_GENRE_MEDIA_ITEM_MAPPING: Final[str] = "genre_media_item_mapping"
+
+
+def load_genre_mapping() -> list[dict[str, Any]]:
+    """Load default genre mapping from JSON file.
+
+    :return: List of genre mapping dictionaries with 'genre' and 'aliases' keys.
+    :raises FileNotFoundError: If genre_mapping.json is missing.
+    :raises ValueError: If JSON is malformed or missing required fields.
+    """
+    try:
+        content = GENRE_MAPPING_FILE.read_text(encoding="utf-8")
+        data = json.loads(content)
+    except FileNotFoundError as err:
+        msg = f"Genre mapping file not found: {GENRE_MAPPING_FILE}"
+        raise FileNotFoundError(msg) from err
+    except json.JSONDecodeError as err:
+        msg = f"Invalid JSON in genre mapping file: {GENRE_MAPPING_FILE}"
+        raise ValueError(msg) from err
+
+    if not isinstance(data, list):
+        msg = f"Genre mapping must be a list, got {type(data).__name__}"
+        raise TypeError(msg)
+
+    for idx, entry in enumerate(data):
+        if not isinstance(entry, dict):
+            msg = f"Genre mapping entry {idx} must be a dict, got {type(entry).__name__}"
+            raise TypeError(msg)
+        if "genre" not in entry:
+            msg = f"Genre mapping entry {idx} missing required field 'genre'"
+            raise ValueError(msg)
+        if "aliases" not in entry:
+            msg = f"Genre mapping entry {idx} missing required field 'aliases'"
+            raise ValueError(msg)
+
+    return cast("list[dict[str, Any]]", data)
+
+
+DEFAULT_GENRE_MAPPING: Final[list[dict[str, Any]]] = load_genre_mapping()
+DEFAULT_GENRES: Final[tuple[str, ...]] = tuple(entry["genre"] for entry in DEFAULT_GENRE_MAPPING)
 
 
 # all other
@@ -932,6 +984,13 @@ ATTR_ELAPSED_TIME: Final[str] = "elapsed_time"
 ATTR_ENABLED: Final[str] = "enabled"
 ATTR_AVAILABLE: Final[str] = "available"
 ATTR_MUTE_LOCK: Final[str] = "mute_lock"
+ATTR_ACTIVE_SOURCE: Final[str] = "active_source"
+ATTR_ACTIVE_PLAYLIST: Final[str] = "active_playlist"
+ATTR_SUPPORTED_FEATURES: Final[str] = "supported_features"
+ATTR_MUTE_CONTROL: Final[str] = "mute_control"
+ATTR_VOLUME_CONTROL: Final[str] = "volume_control"
+ATTR_POWER_CONTROL: Final[str] = "power_control"
+ATTR_PLAY_ACTION_IN_PROGRESS: Final[str] = "play_action_in_progress"
 
 # Album type detection patterns
 LIVE_INDICATORS = [
@@ -963,10 +1022,10 @@ NON_HTTP_PROVIDERS = ("airplay", "sendspin", "snapcast")
 
 # Protocol priority values (lower = more preferred)
 PROTOCOL_PRIORITY: Final[dict[str, int]] = {
-    "sendspin": 10,
+    "airplay": 10,
     "squeezelite": 20,
     "chromecast": 30,
-    "airplay": 40,
+    "sendspin": 40,
     "dlna": 50,
 }
 
@@ -998,4 +1057,53 @@ DEFAULT_PROVIDERS: Final[set[tuple[str, bool]]] = {
     ("sonos", True),
     ("bluesound", True),
     ("heos", True),
+}
+
+EXTERNAL_SOURCES: Final[set[str]] = {
+    # list of sources that are definitely considered "external"
+    # values are matched case-insensitive against the player's active_source
+    # streaming services / connect sources
+    "spotify",
+    "spotify_connect",
+    "spotify connect",
+    "apple_music",
+    "apple music",
+    "tidal",
+    "tidal_connect",
+    "tidal connect",
+    "qobuz",
+    "deezer",
+    "amazon_music",
+    "amazon music",
+    "pandora",
+    "iheartradio",
+    "napster",
+    "rhapsody",
+    "siriusxm",
+    "soundcloud",
+    "tunein",
+    "tune in",
+    "radioparadise",
+    "radio paradise",
+    "radiko",
+    "juke",
+    "alexa",
+    "radio",
+    # bluetooth (bluesound, musiccast)
+    "bluetooth",
+    # physical/analog inputs (sonos, heos, musiccast, demo)
+    "line-in",
+    "linein",
+    "line in",
+    "line_in",
+    "aux",
+    "tuner",
+    # tv / hdmi (sonos, bluesound)
+    "tv",
+    "tv input",
+    "hdmi arc",
+    # local/usb playback on device (musiccast)
+    "usb",
+    # external (hass_players)
+    "external",
 }

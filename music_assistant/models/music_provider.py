@@ -33,6 +33,7 @@ from music_assistant.constants import (
     CONF_ENTRY_LIBRARY_SYNC_BACK,
     CONF_ENTRY_LIBRARY_SYNC_DELETIONS,
     CONF_ENTRY_LIBRARY_SYNC_PLAYLIST_TRACKS,
+    PlaylistPlayableItem,
 )
 
 from .provider import Provider
@@ -120,6 +121,11 @@ class MusicProvider(Provider):
         yield  # type: ignore[misc]
         raise NotImplementedError
 
+    async def get_library_genres(self) -> AsyncGenerator[str, None]:
+        """Retrieve library genres from the provider."""
+        yield  # type: ignore[misc]
+        raise NotImplementedError
+
     async def get_artist(self, prov_artist_id: str) -> Artist:
         """Get full artist details by id."""
         raise NotImplementedError
@@ -187,6 +193,10 @@ class MusicProvider(Provider):
         """
         raise NotImplementedError
 
+    async def get_item_genre_names(self, media_type: MediaType, item_id: str) -> set[str]:
+        """Return genre names for a single item."""
+        raise NotImplementedError
+
     async def get_album_tracks(
         self,
         prov_album_id: str,
@@ -201,7 +211,7 @@ class MusicProvider(Provider):
         self,
         prov_playlist_id: str,
         page: int = 0,
-    ) -> list[Track]:
+    ) -> Sequence[PlaylistPlayableItem]:
         """Get all playlist tracks for given playlist id.
 
         Only called if provider supports ProviderFeature.LIBRARY_PLAYLISTS.
@@ -368,8 +378,8 @@ class MusicProvider(Provider):
         """
         raise NotImplementedError
 
-    async def create_playlist(self, name: str) -> Playlist:
-        """Create a new playlist on provider with given name.
+    async def create_playlist(self, name: str, media_types: set[MediaType]) -> Playlist:
+        """Create a new playlist on provider with given name and targeting media_types.
 
         Only called if provider supports ProviderFeature.PLAYLIST_CREATE.
         """
@@ -742,6 +752,24 @@ class MusicProvider(Provider):
             category=CACHE_CATEGORY_PREV_LIBRARY_IDS,
         )
 
+    async def _sync_item_genres(
+        self,
+        media_type: MediaType,
+        provider_item_id: str,
+        library_item_id: int,
+        fallback_genres: set[str] | None = None,
+    ) -> None:
+        try:
+            genre_names = await self.get_item_genre_names(media_type, provider_item_id)
+        except NotImplementedError:
+            if fallback_genres is None:
+                return
+            genre_names = fallback_genres
+
+        await self.mass.music.genres.sync_media_item_genres(
+            media_type, library_item_id, set(genre_names)
+        )
+
     async def _sync_library_artists(self) -> set[int]:
         """Sync Library Artists to Music Assistant library."""
         self.logger.debug("Start sync of Artists to Music Assistant library.")
@@ -769,6 +797,17 @@ class MusicProvider(Provider):
                 if not library_item.favorite and prov_item.favorite:
                     # existing library item not favorite but should be
                     await self.mass.music.artists.set_favorite(library_item.item_id, True)
+                fallback_genres = (
+                    set(prov_item.metadata.genres)
+                    if prov_item.metadata and prov_item.metadata.genres
+                    else None
+                )
+                await self._sync_item_genres(
+                    MediaType.ARTIST,
+                    prov_item.item_id,
+                    int(library_item.item_id),
+                    fallback_genres,
+                )
                 cur_db_ids.add(int(library_item.item_id))
                 await asyncio.sleep(0)  # yield to eventloop
             except MusicAssistantError as err:
@@ -811,6 +850,17 @@ class MusicProvider(Provider):
                 if not library_item.favorite and prov_item.favorite:
                     # existing library item not favorite but should be
                     await self.mass.music.albums.set_favorite(library_item.item_id, True)
+                fallback_genres = (
+                    set(prov_item.metadata.genres)
+                    if prov_item.metadata and prov_item.metadata.genres
+                    else None
+                )
+                await self._sync_item_genres(
+                    MediaType.ALBUM,
+                    prov_item.item_id,
+                    int(library_item.item_id),
+                    fallback_genres,
+                )
                 cur_db_ids.add(int(library_item.item_id))
                 await asyncio.sleep(0)  # yield to eventloop
                 # optionally add album tracks to library
@@ -845,6 +895,17 @@ class MusicProvider(Provider):
                     library_track = await self.mass.music.tracks.update_item_in_library(
                         library_track.item_id, prov_track
                     )
+                fallback_genres = (
+                    set(prov_track.metadata.genres)
+                    if prov_track.metadata and prov_track.metadata.genres
+                    else None
+                )
+                await self._sync_item_genres(
+                    MediaType.TRACK,
+                    prov_track.item_id,
+                    int(library_track.item_id),
+                    fallback_genres,
+                )
                 await asyncio.sleep(0)  # yield to eventloop
             except MusicAssistantError as err:
                 self.logger.warning(
@@ -893,6 +954,18 @@ class MusicProvider(Provider):
                         library_item.item_id, prov_item
                     )
 
+                fallback_genres = (
+                    set(prov_item.metadata.genres)
+                    if prov_item.metadata and prov_item.metadata.genres
+                    else None
+                )
+                await self._sync_item_genres(
+                    MediaType.AUDIOBOOK,
+                    prov_item.item_id,
+                    int(library_item.item_id),
+                    fallback_genres,
+                )
+
                 cur_db_ids.add(int(library_item.item_id))
                 await asyncio.sleep(0)  # yield to eventloop
             except MusicAssistantError as err:
@@ -932,6 +1005,11 @@ class MusicProvider(Provider):
                     library_item = await self.mass.music.playlists.update_item_in_library(
                         library_item.item_id, prov_item
                     )
+                elif prov_item.supported_mediatypes != library_item.supported_mediatypes:
+                    # update if supported mediatypes changed
+                    library_item = await self.mass.music.playlists.update_item_in_library(
+                        library_item.item_id, prov_item
+                    )
                 if not library_item.favorite and prov_item.favorite:
                     # existing library item not favorite but should be
                     await self.mass.music.playlists.set_favorite(library_item.item_id, True)
@@ -957,8 +1035,13 @@ class MusicProvider(Provider):
             "Start sync of Playlist Tracks to Music Assistant library for playlist %s.",
             provider_playlist.name,
         )
-        async for prov_track in self.iter_playlist_tracks(provider_playlist.item_id):
-            library_track = await self.mass.music.tracks.get_library_item_by_prov_mappings(
+        async for _prov_track in self.iter_playlist_tracks(provider_playlist.item_id):
+            prov_track: PlaylistPlayableItem | Podcast = _prov_track
+            if isinstance(_prov_track, PodcastEpisode):
+                # In MA, only full podcasts can be synced to the library
+                prov_track = await self.get_podcast(_prov_track.podcast.item_id)
+            controller = self.mass.music.get_controller(prov_track.media_type)
+            library_track = await controller.get_library_item_by_prov_mappings(
                 prov_track.provider_mappings,
             )
             try:
@@ -966,12 +1049,24 @@ class MusicProvider(Provider):
                     # add item to the library
                     for prov_map in prov_track.provider_mappings:
                         prov_map.in_library = True
-                    library_track = await self.mass.music.tracks.add_item_to_library(prov_track)
+                    library_track = await controller.add_item_to_library(prov_track)  # type: ignore[arg-type]
                 elif not self._check_provider_mappings(library_track, prov_track, True):
                     # existing library track but provider mapping doesn't match
-                    library_track = await self.mass.music.tracks.update_item_in_library(
-                        library_track.item_id, prov_track
+                    library_track = await controller.update_item_in_library(
+                        library_track.item_id,
+                        prov_track,  # type: ignore[arg-type]
                     )
+                fallback_genres = (
+                    set(prov_track.metadata.genres)
+                    if prov_track.metadata and prov_track.metadata.genres
+                    else None
+                )
+                await self._sync_item_genres(
+                    MediaType.TRACK,
+                    prov_track.item_id,
+                    int(library_track.item_id),
+                    fallback_genres,
+                )
                 await asyncio.sleep(0)  # yield to eventloop
             except MusicAssistantError as err:
                 self.logger.warning(
@@ -1015,6 +1110,17 @@ class MusicProvider(Provider):
                 if not library_item.favorite and prov_item.favorite:
                     # existing library item not favorite but should be
                     await self.mass.music.tracks.set_favorite(library_item.item_id, True)
+                fallback_genres = (
+                    set(prov_item.metadata.genres)
+                    if prov_item.metadata and prov_item.metadata.genres
+                    else None
+                )
+                await self._sync_item_genres(
+                    MediaType.TRACK,
+                    prov_item.item_id,
+                    int(library_item.item_id),
+                    fallback_genres,
+                )
                 cur_db_ids.add(int(library_item.item_id))
                 await asyncio.sleep(0)  # yield to eventloop
             except MusicAssistantError as err:
@@ -1052,6 +1158,17 @@ class MusicProvider(Provider):
                 if not library_item.favorite and prov_item.favorite:
                     # existing library item not favorite but should be
                     await self.mass.music.podcasts.set_favorite(library_item.item_id, True)
+                fallback_genres = (
+                    set(prov_item.metadata.genres)
+                    if prov_item.metadata and prov_item.metadata.genres
+                    else None
+                )
+                await self._sync_item_genres(
+                    MediaType.PODCAST,
+                    prov_item.item_id,
+                    int(library_item.item_id),
+                    fallback_genres,
+                )
                 cur_db_ids.add(int(library_item.item_id))
                 await asyncio.sleep(0)  # yield to eventloop
 
@@ -1179,7 +1296,7 @@ class MusicProvider(Provider):
     async def iter_playlist_tracks(
         self,
         prov_playlist_id: str,
-    ) -> AsyncGenerator[Track, None]:
+    ) -> AsyncGenerator[PlaylistPlayableItem, None]:
         """Iterate playlist tracks for the given provider playlist id."""
         page = 0
         while True:

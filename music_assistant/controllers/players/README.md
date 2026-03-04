@@ -46,7 +46,7 @@ The `PlayerState` is a dataclass representing the final state of the player. It:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                     Player (Internal)                            │
+│                     Player (Internal)                           │
 │  - Provider-specific implementation                             │
 │  - Control methods (play, pause, volume_set, etc.)              │
 │  - Raw state (_attr_volume_level, _attr_playback_state, etc.)   │
@@ -309,7 +309,7 @@ Key scenarios to test:
 ### Configuration Storage
 
 Protocol links are persisted in player configuration:
-- `linked_protocol_player_ids` - List of protocol player IDs
+- `linked_protocol_ids` - List of protocol player IDs
 - Restored on restart for fast reconnection
 
 ### Key Methods (in protocol_linking.py)
