@@ -1862,9 +1862,11 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
 
     async def on_player_config_change(self, config: PlayerConfig, changed_keys: set[str]) -> None:
         """Call (by config manager) when the configuration of a player changes."""
-        if CONF_MIN_VOLUME in changed_keys or CONF_MAX_VOLUME in changed_keys:
-            min_vol = int(config.get_value(CONF_MIN_VOLUME) or 0)
-            max_vol = int(config.get_value(CONF_MAX_VOLUME) or 100)
+        min_vol_changed = f"values/{CONF_MIN_VOLUME}" in changed_keys
+        max_vol_changed = f"values/{CONF_MAX_VOLUME}" in changed_keys
+        if min_vol_changed or max_vol_changed:
+            min_vol = int(cast("int", config.get_value(CONF_MIN_VOLUME) or 0))
+            max_vol = int(cast("int", config.get_value(CONF_MAX_VOLUME) or 100))
             if min_vol > max_vol:
                 msg = "Minimum volume cannot exceed maximum volume"
                 raise InvalidDataError(msg)
