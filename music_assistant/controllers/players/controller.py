@@ -1865,8 +1865,10 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
         min_vol_changed = f"values/{CONF_MIN_VOLUME}" in changed_keys
         max_vol_changed = f"values/{CONF_MAX_VOLUME}" in changed_keys
         if min_vol_changed or max_vol_changed:
-            min_vol = int(cast("int", config.get_value(CONF_MIN_VOLUME) or 0))
-            max_vol = int(cast("int", config.get_value(CONF_MAX_VOLUME) or 100))
+            raw_min = config.get_value(CONF_MIN_VOLUME)
+            raw_max = config.get_value(CONF_MAX_VOLUME)
+            min_vol = int(cast("int", raw_min)) if raw_min is not None else 0
+            max_vol = int(cast("int", raw_max)) if raw_max is not None else 100
             if min_vol > max_vol:
                 msg = "Minimum volume cannot exceed maximum volume"
                 raise InvalidDataError(msg)
