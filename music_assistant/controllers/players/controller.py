@@ -1565,6 +1565,22 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
         if became_inactive and (player.state.active_group or player.state.synced_to):
             self.mass.create_task(self._cleanup_player_memberships(player.player_id))
 
+        # enforce volume limits when volume changes externally
+        if "volume_level" in changed_values and player.state.volume_level is not None:
+            min_volume = int(
+                self.mass.config.get_raw_player_config_value(
+                    player_id, CONF_MIN_VOLUME, CONF_ENTRY_MIN_VOLUME.default_value
+                )
+            )
+            max_volume = int(
+                self.mass.config.get_raw_player_config_value(
+                    player_id, CONF_MAX_VOLUME, CONF_ENTRY_MAX_VOLUME.default_value
+                )
+            )
+            clamped = max(min_volume, min(max_volume, player.state.volume_level))
+            if clamped != player.state.volume_level:
+                self.mass.create_task(self.cmd_volume_set(player_id, clamped))
+
         # signal player update on the eventbus
         if player.state.type != PlayerType.PROTOCOL:
             self.mass.signal_event(EventType.PLAYER_UPDATED, object_id=player_id, data=player)
