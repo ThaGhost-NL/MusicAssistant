@@ -1316,7 +1316,7 @@ class StreamsController(CoreController):
         )
 
         async def fetch_announcement() -> None:
-            fmt = announcement_url.rsplit(".", maxsplit=1)[-1]
+            fmt = announcement_url.rsplit(".")[-1]
             try:
                 async for chunk in get_ffmpeg_stream(
                     audio_input=announcement_url,
@@ -1444,10 +1444,7 @@ class StreamsController(CoreController):
             filter_rule = f"loudnorm=I={streamdetails.target_loudness}:TP=-2.0:LRA=10.0:offset=0.0"
             filter_rule += ":print_format=json"
             filter_params.append(filter_rule)
-        elif streamdetails.volume_normalization_mode in (
-            VolumeNormalizationMode.FIXED_GAIN,
-            VolumeNormalizationMode.FALLBACK_FIXED_GAIN,
-        ):
+        elif streamdetails.volume_normalization_mode == VolumeNormalizationMode.FIXED_GAIN:
             # apply user defined fixed volume/gain correction
             config_key = (
                 CONF_VOLUME_NORMALIZATION_FIXED_GAIN_TRACKS

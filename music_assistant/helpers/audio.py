@@ -705,21 +705,6 @@ async def get_media_stream(
                     )
                 )
 
-        # when using fallback fixed gain, perform a background loudness analysis
-        # so the measurement is available for future playback
-        if (
-            streamdetails.loudness is None
-            and streamdetails.volume_normalization_mode
-            == VolumeNormalizationMode.FALLBACK_FIXED_GAIN
-            and (finished or (seconds_received >= 300))
-        ):
-            logger.log(
-                VERBOSE_LOG_LEVEL,
-                "Scheduling loudness analysis for %s after fixed gain fallback playback",
-                streamdetails.uri,
-            )
-            mass.create_task(analyze_loudness(mass, streamdetails))
-
 
 def create_wave_header(
     samplerate: int = 44100, channels: int = 2, bitspersample: int = 16, duration: int | None = None
@@ -1669,9 +1654,8 @@ def _get_normalization_mode(
         return VolumeNormalizationMode.DISABLED
 
     # handle no measurement available and fallback to fixed gain is allowed
-    # preserve FALLBACK_FIXED_GAIN so we can trigger loudness analysis after playback
     if streamdetails.loudness is None and preference == VolumeNormalizationMode.FALLBACK_FIXED_GAIN:
-        return VolumeNormalizationMode.FALLBACK_FIXED_GAIN
+        return VolumeNormalizationMode.FIXED_GAIN
 
     # handle measurement available - chosen mode is measurement
     if streamdetails.loudness is not None and preference not in (
