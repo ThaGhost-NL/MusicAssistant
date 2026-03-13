@@ -426,7 +426,7 @@ class MusicbrainzProvider(MetadataProvider):
                 return MusicBrainzArtist.from_raw(artist)
         return None
 
-    async def search_recording(
+    async def get_release_group_by_track_name(
         self, artist_name: str, track_name: str
     ) -> tuple[MusicBrainzArtist, MusicBrainzReleaseGroup | None] | None:
         """Search for a recording by artist and track name.

@@ -628,7 +628,7 @@ class MetaDataController(CoreController):
             return None
         musicbrainz: MusicbrainzProvider = cast("MusicbrainzProvider", musicbrainz_provider)
 
-        mb_result = await musicbrainz.search_recording(artist_name, clean_track_name)
+        mb_result = await musicbrainz.get_release_group_by_track_name(artist_name, clean_track_name)
         if not mb_result:
             self.logger.debug("No MusicBrainz match for '%s - %s'", artist_name, clean_track_name)
             return None
