@@ -157,6 +157,11 @@ VERSION_PARTS = (
     "radio",
     "extended",
     "single",
+    "edition",
+    "anniversary",
+    "stereo",
+    "album",
+    "bonus",
 )
 IGNORE_TITLE_PARTS = (
     # strings that may be stripped off a title part
@@ -178,17 +183,24 @@ WITH_TITLE_WORDS = (
 )
 
 # Keywords for aggressive search cleaning (includes featuring).
-_SEARCH_KEYWORDS = (
-    r"remaster(?:ed)?|anniversary|instrumental|live|edit(?:ion)?|single(?:s)?|"
-    r"stereo|album|radio|version|feat(?:uring)?|ft|mix|bonus|video|extended|"
-    r"acoustic|unplugged|karaoke|deluxe|remix"
-)
+_VERSION_PATTERN = "|".join(re.escape(v) for v in VERSION_PARTS)
+
+_FEAT_PATTERN = r"feat(?:uring)?|ft"
+
+_SEARCH_PATTERN = rf"{_VERSION_PATTERN}|{_FEAT_PATTERN}"
+
 _SEARCH_PAREN_PATTERN = re.compile(
-    rf"[\(\[][^\)\]]*\b({_SEARCH_KEYWORDS})\b[^\)\]]*[\)\]]",
+    rf"[\(\[][^\)\]]*\b({_SEARCH_PATTERN})\b[^\)\]]*[\)\]]",
     re.IGNORECASE,
 )
+
 _SEARCH_HYPHEN_PATTERN = re.compile(
-    rf"(\s*-\s*(\d{{4}}|{_SEARCH_KEYWORDS}).*)$",
+    rf"(\s*-\s*(\d{{4}}|{_SEARCH_PATTERN}).*)$",
+    re.IGNORECASE,
+)
+
+_DISPLAY_STRIP_PATTERN = re.compile(
+    r"\s*[\(\[](official\s+)?(lyric\s+|music\s+)?(video|audio)[\)\]]$",
     re.IGNORECASE,
 )
 
@@ -199,18 +211,6 @@ _FEATURING_PATTERNS = (
     " feat ",
     " ft. ",
     " ft ",
-)
-
-# Suffixes to strip for display purposes only.
-_DISPLAY_SUFFIXES = (
-    "[Lyric Video]",
-    "[Official Video]",
-    "[Music Video]",
-    "[Official Audio]",
-    "(Official Video)",
-    "(Lyric Video)",
-    "(Music Video)",
-    "(Official Audio)",
 )
 
 
@@ -246,19 +246,8 @@ def clean_title_for_search(title: str) -> str:
 
 
 def clean_title_for_display(title: str) -> str:
-    """Remove video-related suffixes from a song title for display.
-
-    Performs minimal cleaning, removing only obvious artifacts.
-    Preserves featuring credits and version information that may be relevant to the user.
-
-    :param title: The song title to clean.
-    """
-    cleaned = title
-    for suffix in _DISPLAY_SUFFIXES:
-        if cleaned.endswith(suffix):
-            cleaned = cleaned[: -len(suffix)].strip()
-            break
-    return cleaned
+    """Remove video-related suffixes from a song title for display."""
+    return _DISPLAY_STRIP_PATTERN.sub("", title).strip()
 
 
 def filename_from_string(string: str) -> str:
