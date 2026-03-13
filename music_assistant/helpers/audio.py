@@ -927,8 +927,11 @@ async def get_icy_radio_stream(
                         if streamdetails.queue_id:
                             mass.player_queues.signal_update(streamdetails.queue_id)
                         # Fetch artist artwork in background
-                        asyncio.create_task(
-                            mass.metadata.update_radio_stream_artwork(streamdetails)
+                        mass.call_later(
+                            0.2,
+                            mass.metadata.update_radio_stream_artwork,
+                            streamdetails,
+                            task_id=f"update_radio_artwork_{streamdetails.queue_id}",
                         )
 
 
@@ -1044,8 +1047,11 @@ async def _update_hls_radio_metadata(
 
                         # Fetch artist artwork if not provided in stream metadata
                         if artist and title and not image_url:
-                            asyncio.create_task(
-                                mass.metadata.update_radio_stream_artwork(streamdetails)
+                            mass.call_later(
+                                0.2,
+                                mass.metadata.update_radio_stream_artwork,
+                                streamdetails,
+                                task_id=f"update_radio_artwork_{streamdetails.queue_id}",
                             )
 
                 # Only check the most recent EXTINF
