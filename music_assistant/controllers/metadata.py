@@ -74,7 +74,7 @@ if TYPE_CHECKING:
 
     from music_assistant import MusicAssistant
     from music_assistant.models.metadata_provider import MetadataProvider
-    from music_assistant.providers.musicbrainz import MusicbrainzProvider
+    from music_assistant.providers.musicbrainz import MusicbrainzProvider, MusicBrainzReleaseGroup
 
 
 def _detect_image_format(path: str) -> str:
@@ -602,6 +602,35 @@ class MetaDataController(CoreController):
                 return metadata.lyrics, metadata.lrc_lyrics
         return None, None
 
+    async def _get_release_group_artwork(
+        self, mb_release_group: MusicBrainzReleaseGroup
+    ) -> MediaItemMetadata | None:
+        """Try to get thumb artwork for a release group from metadata providers.
+
+        :param mb_release_group: MusicBrainz release group to look up.
+        """
+        temp_album = Album(
+            item_id="temp",
+            provider="temp",
+            name=mb_release_group.title,
+            provider_mappings=set(),
+        )
+        temp_album.add_external_id(ExternalID.MB_RELEASEGROUP, mb_release_group.id)
+        for provider in self.providers:
+            if ProviderFeature.ALBUM_METADATA not in provider.supported_features:
+                continue
+            try:
+                if metadata := await provider.get_album_metadata(temp_album):
+                    if thumb := self._get_thumb_image(metadata):
+                        return thumb
+            except (
+                ProviderUnavailableError,
+                ResourceTemporarilyUnavailable,
+                InvalidDataError,
+            ):
+                pass
+        return None
+
     async def get_track_metadata_by_name(
         self,
         artist_name: str,
@@ -633,35 +662,29 @@ class MetaDataController(CoreController):
             self.logger.debug("No MusicBrainz match for '%s - %s'", artist_name, clean_track_name)
             return None
 
-        mb_artist, single_rg, album_rg = mb_result
+        mb_artist, mb_release_groups = mb_result
 
-        # Try artwork for single first, then album
-        for mb_release_group in (single_rg, album_rg):
-            if not mb_release_group:
-                continue
-            temp_album = Album(
-                item_id="temp",
-                provider="temp",
-                name=mb_release_group.title,
-                provider_mappings=set(),
+        # Prefer single artwork (exact track art), then fall back to album artwork
+        singles = [rg for rg in mb_release_groups if rg.primary_type == "Single"]
+        albums = [rg for rg in mb_release_groups if rg.primary_type == "Album"]
+
+        for mb_release_group in singles:
+            if thumb := await self._get_release_group_artwork(mb_release_group):
+                return thumb
+
+        if singles:
+            self.logger.debug(
+                "No artwork found for single release of '%s - %s', trying album artwork",
+                artist_name,
+                clean_track_name,
             )
-            temp_album.add_external_id(ExternalID.MB_RELEASEGROUP, mb_release_group.id)
-            for provider in self.providers:
-                if ProviderFeature.ALBUM_METADATA not in provider.supported_features:
-                    continue
-                try:
-                    if metadata := await provider.get_album_metadata(temp_album):
-                        if thumb := self._get_thumb_image(metadata):
-                            return thumb
-                except (
-                    ProviderUnavailableError,
-                    ResourceTemporarilyUnavailable,
-                    InvalidDataError,
-                ):
-                    pass
+
+        for mb_release_group in albums:
+            if thumb := await self._get_release_group_artwork(mb_release_group):
+                return thumb
 
         # Log when falling back to artist artwork
-        if not mb_release_group:
+        if not mb_release_groups:
             self.logger.debug(
                 "No album found for '%s - %s', falling back to artist artwork",
                 artist_name,
