@@ -428,7 +428,10 @@ class MusicbrainzProvider(MetadataProvider):
 
     async def get_release_group_by_track_name(
         self, artist_name: str, track_name: str
-    ) -> tuple[MusicBrainzArtist, MusicBrainzReleaseGroup | None] | None:
+    ) -> (
+        tuple[MusicBrainzArtist, MusicBrainzReleaseGroup | None, MusicBrainzReleaseGroup | None]
+        | None
+    ):
         """Search for a recording by artist and track name.
 
         Finds the original studio recording by selecting the one with the earliest
@@ -474,35 +477,36 @@ class MusicbrainzProvider(MetadataProvider):
         # Sort by first-release-date to find the earliest (likely original studio recording)
         matches.sort(key=lambda x: x[2] if x[2] else "9999")
 
-        # Try recordings in order, looking for one with a studio album
+        # Try recordings in order, looking for one with release groups
         for recording, artist, first_release_date in matches:
-            if release_group := self._get_release_group_by_date(recording, first_release_date):
-                return (MusicBrainzArtist.from_raw(artist), release_group)
+            single_rg, album_rg = self._get_release_group_by_date(
+                recording, first_release_date, track_name
+            )
+            if single_rg or album_rg:
+                return (MusicBrainzArtist.from_raw(artist), single_rg, album_rg)
 
         # Fall back to the earliest recording (for artist artwork at least)
         recording, artist, _ = matches[0]
-        return (MusicBrainzArtist.from_raw(artist), None)
+        return (MusicBrainzArtist.from_raw(artist), None, None)
 
     def _get_release_group_by_date(
-        self, recording: dict[str, Any], first_release_date: str
-    ) -> MusicBrainzReleaseGroup | None:
-        """Find the best release group for a recording, preferring original album.
+        self, recording: dict[str, Any], first_release_date: str, track_name: str = ""
+    ) -> tuple[MusicBrainzReleaseGroup | None, MusicBrainzReleaseGroup | None]:
+        """Find the best release groups for a recording.
 
-        Matches studio albums by comparing release year to the recording's
-        first-release-date to find the original album rather than compilations
-        or reissues.
+        Returns a single match (name matches track) and an album match separately,
+        so the caller can decide fallback order.
 
         :param recording: MusicBrainz recording dict.
         :param first_release_date: The recording's first-release-date (e.g. "1982-03-29").
+        :param track_name: Track name for matching singles.
         """
         releases = recording.get("releases", [])
         if not releases:
-            return None
+            return None, None
 
-        # Extract year from first-release-date for matching
         release_year = first_release_date[:4] if len(first_release_date) >= 4 else ""
 
-        # Collect studio albums (Album type, no secondary types) with their release dates
         studio_albums: list[tuple[dict[str, Any], str]] = []
         all_release_groups: dict[str, dict[str, Any]] = {}
 
@@ -511,27 +515,35 @@ class MusicbrainzProvider(MetadataProvider):
             rg_id = rg.get("id")
             if not rg_id:
                 continue
-
             all_release_groups[rg_id] = rg
             primary_type = rg.get("primary-type")
             secondary_types = rg.get("secondary-types", [])
-
-            # Only consider studio albums (Album type, no secondary types like Live/Compilation)
             if primary_type == "Album" and not secondary_types:
                 release_date = release.get("date", "") or ""
                 studio_albums.append((rg, release_date))
 
-        if not studio_albums:
-            return None
+        # Find single match (name matches track name)
+        single_match = None
+        if track_name:
+            for rg in all_release_groups.values():
+                if rg.get("primary-type") == "Single" and compare_strings(
+                    rg.get("title", ""), track_name, strict=False
+                ):
+                    single_match = MusicBrainzReleaseGroup.from_raw(rg)
+                    break
 
-        # If we have a release year, try to find an album from that year
-        if release_year:
-            for rg, release_date in studio_albums:
-                if release_date.startswith(release_year):
-                    return MusicBrainzReleaseGroup.from_raw(rg)
+        # Find album match (non-compilation studio album)
+        album_match = None
+        if studio_albums:
+            if release_year:
+                for rg, release_date in studio_albums:
+                    if release_date.startswith(release_year):
+                        album_match = MusicBrainzReleaseGroup.from_raw(rg)
+                        break
+            if not album_match:
+                album_match = MusicBrainzReleaseGroup.from_raw(studio_albums[0][0])
 
-        # Fall back to the first studio album found
-        return MusicBrainzReleaseGroup.from_raw(studio_albums[0][0])
+        return single_match, album_match
 
     @use_cache(86400 * 30)  # Cache for 30 days
     @throttle_with_retries

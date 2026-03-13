@@ -633,10 +633,12 @@ class MetaDataController(CoreController):
             self.logger.debug("No MusicBrainz match for '%s - %s'", artist_name, clean_track_name)
             return None
 
-        mb_artist, mb_release_group = mb_result
+        mb_artist, single_rg, album_rg = mb_result
 
-        # Try album artwork first if we have a unique release group
-        if mb_release_group:
+        # Try artwork for single first, then album
+        for mb_release_group in (single_rg, album_rg):
+            if not mb_release_group:
+                continue
             temp_album = Album(
                 item_id="temp",
                 provider="temp",
