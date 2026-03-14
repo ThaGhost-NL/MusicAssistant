@@ -6,8 +6,10 @@ from unittest.mock import MagicMock
 from music_assistant.constants import UNKNOWN_ARTIST
 from music_assistant.helpers import tags
 from music_assistant.helpers.tags import (
+    AudioTags,
     _parse_apev2_tags,
     _parse_vorbis_tags,
+    clean_items,
     parse_tags_mutagen,
     split_artists,
 )
@@ -419,3 +421,77 @@ def test_parse_apev2_tags_genre_multi_value() -> None:
     result = _parse_apev2_tags(mock_tags)
 
     assert result.get("genre") == ["Rock", "Pop", "Jazz"]
+
+
+def test_clean_items() -> None:
+    """Test that clean_items strips and cleans without splitting on delimiters."""
+    assert clean_items(None) == ()
+    assert clean_items("ave;new") == ("ave;new",)
+    assert clean_items(["ave;new", "佐倉紗織"]) == ("ave;new", "佐倉紗織")
+    assert clean_items(["  spaces  ", "", "valid"]) == ("spaces", "valid")
+    assert clean_items("simple") == ("simple",)
+
+
+def test_split_artists_semicolon_in_name_with_mbids() -> None:
+    """Test that semicolons in artist names are preserved when MBIDs guide the split."""
+    # "ave;new feat.佐倉紗織" with 2 MBIDs: featuring split gives correct count,
+    # so semicolon in "ave;new" should be preserved
+    result = split_artists("ave;new feat. 佐倉紗織", expected_count=2)
+    assert result == ("ave;new", "佐倉紗織")
+
+
+def test_split_artists_semicolon_as_last_resort_separator() -> None:
+    """Test that semicolons work as last-resort separator when count matches."""
+    # "Artist A;Artist B" with 2 MBIDs: no featuring split, extra splitters fail,
+    # semicolon split gives exactly 2 which matches expected_count
+    result = split_artists("Artist A;Artist B", expected_count=2)
+    assert result == ("Artist A", "Artist B")
+
+
+def test_split_artists_semicolon_preserved_single() -> None:
+    """Test that semicolons are preserved when expected_count is 1."""
+    result = split_artists("ave;new", expected_count=1)
+    assert result == ("ave;new",)
+
+
+def test_split_artists_semicolon_no_mbids() -> None:
+    """Test that semicolons still split when there are no MBIDs (backward compat)."""
+    result = split_artists("Artist A;Artist B", expected_count=None)
+    assert result == ("Artist A", "Artist B")
+
+
+def test_artists_property_multivalue_with_semicolons() -> None:
+    """Test that multi-value artists tag preserves semicolons in names."""
+    _tags = AudioTags(
+        raw={},
+        sample_rate=44100,
+        channels=2,
+        bits_per_sample=16,
+        format="flac",
+        bit_rate=0,
+        duration=None,
+        has_cover_image=False,
+        filename="test.flac",
+        tags={"artists": ["ave;new", "佐倉紗織"]},
+    )
+    assert _tags.artists == ("ave;new", "佐倉紗織")
+
+
+def test_artists_property_single_with_semicolons_and_mbids() -> None:
+    """Test that single artist tag with semicolons uses MBIDs to guide splitting."""
+    _tags = AudioTags(
+        raw={},
+        sample_rate=44100,
+        channels=2,
+        bits_per_sample=16,
+        format="flac",
+        bit_rate=0,
+        duration=None,
+        has_cover_image=False,
+        filename="test.flac",
+        tags={
+            "artist": "ave;new feat. 佐倉紗織",
+            "musicbrainzartistid": ["id1", "id2"],
+        },
+    )
+    assert _tags.artists == ("ave;new", "佐倉紗織")

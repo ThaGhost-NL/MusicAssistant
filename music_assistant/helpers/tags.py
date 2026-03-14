@@ -40,6 +40,22 @@ def clean_tuple(values: Iterable[str]) -> tuple[str, ...]:
     return tuple(x.strip() for x in values if x not in (None, "", " "))
 
 
+def clean_items(org: str | list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
+    """Clean a tag value (strip whitespace, remove empties) without splitting on delimiters.
+
+    Use this instead of split_items() when the input is already a native multi-value
+    list from the tag format (e.g., multiple Vorbis ARTIST fields, ID3 TXXX:ARTISTS).
+    Individual items are trusted as-is and not split on semicolons.
+
+    :param org: A string, list of strings, or None.
+    """
+    if org is None:
+        return ()
+    if isinstance(org, str):
+        return clean_tuple((org,))
+    return clean_tuple(org)
+
+
 def split_items(
     org_str: str | list[str] | tuple[str, ...] | None, allow_unsafe_splitters: bool = False
 ) -> tuple[str, ...]:
@@ -198,11 +214,23 @@ def split_artists(
         If 1: return as-is without any splitting.
         If > 1: split on featuring splitters first, then extra splitters to reach target.
     """
-    artists = split_items(org_artists, allow_unsafe_splitters=False)
+    artists = clean_items(org_artists)
 
     # If expected_count is 1, return as-is without any splitting
     if expected_count == 1:
         return artists
+
+    # Step 0: When no MBID guidance, split on semicolons (backward compat).
+    # With MBID guidance, semicolons are deferred to a last-resort step
+    # so that artist names containing semicolons (e.g., "ave;new") are preserved.
+    if expected_count is None:
+        expanded: list[str] = []
+        for item in artists:
+            if TAG_SPLITTER in item:
+                expanded.extend(p.strip() for p in item.split(TAG_SPLITTER) if p.strip())
+            else:
+                expanded.append(item)
+        artists = tuple(expanded) if expanded else artists
 
     # Step 1: Always split on featuring splitters
     final_artists: list[str] = []
@@ -217,6 +245,19 @@ def split_artists(
 
     # Step 3: Need more artists - split on extra splitters to reach expected_count
     final_artists = _split_to_target_count(final_artists, expected_count, org_artists)
+
+    # Step 4: If still not at target, try semicolon splitting as last resort.
+    # Only accept the semicolon split if the resulting count exactly matches expected_count.
+    if len(final_artists) < expected_count:
+        semicolon_artists: list[str] = []
+        for item in final_artists:
+            if TAG_SPLITTER in item:
+                parts = [p.strip() for p in item.split(TAG_SPLITTER) if p.strip()]
+                semicolon_artists.extend(parts)
+            else:
+                semicolon_artists.append(item)
+        if len(semicolon_artists) == expected_count:
+            final_artists = semicolon_artists
 
     return tuple(final_artists) if final_artists else artists
 
@@ -284,7 +325,7 @@ class AudioTags:
         """Return track artists."""
         # prefer multi-artist tag (ARTISTS plural)
         if tag := self.tags.get("artists"):
-            artists = split_items(tag)
+            artists = clean_items(tag)
             # Warn if ARTISTS tag count doesn't match MB Artist ID count
             mb_id_count = len(self.musicbrainz_artistids)
             if mb_id_count and mb_id_count != len(artists):
@@ -297,14 +338,12 @@ class AudioTags:
             return artists
         # fallback to regular artist string
         if tag := self.tags.get("artist"):
-            if TAG_SPLITTER in tag:
-                return split_items(tag)
             # Use MB artist ID count to guide splitting
             # - 0 IDs: only split on "feat." etc., not on "&" or ","
             # - 1 ID: don't split at all
             # - 2+ IDs: split to match the expected count
             mb_id_count = len(self.musicbrainz_artistids)
-            return split_artists(tag, expected_count=mb_id_count if mb_id_count else None)
+            return split_artists(tag, expected_count=mb_id_count or None)
         # fallback to parsing from filename
         title = self.filename.rsplit(os.sep, 1)[-1].split(".")[0]
         if " - " in title:
@@ -319,11 +358,9 @@ class AudioTags:
         """Return writer(s)."""
         # prefer multi-item tag
         if tag := self.tags.get("writers"):
-            return split_items(tag)
+            return clean_items(tag)
         # fallback to regular writer string
         if tag := self.tags.get("writer"):
-            if TAG_SPLITTER in tag:
-                return split_items(tag)
             # No MB IDs for writers, only split on featuring splitters
             return split_artists(tag, expected_count=None)
         return ()
@@ -333,7 +370,7 @@ class AudioTags:
         """Return (all) album artists (if any)."""
         # prefer multi-artist tag (ALBUMARTISTS plural)
         if tag := self.tags.get("albumartists"):
-            artists = split_items(tag)
+            artists = clean_items(tag)
             # Warn if ALBUMARTISTS tag count doesn't match MB Album Artist ID count
             mb_id_count = len(self.musicbrainz_albumartistids)
             if mb_id_count and mb_id_count != len(artists):
@@ -347,11 +384,9 @@ class AudioTags:
             return artists
         # fallback to regular album artist string
         if tag := self.tags.get("albumartist"):
-            if TAG_SPLITTER in tag:
-                return split_items(tag)
             # Use MB album artist ID count to guide splitting
             mb_id_count = len(self.musicbrainz_albumartistids)
-            return split_artists(tag, expected_count=mb_id_count if mb_id_count else None)
+            return split_artists(tag, expected_count=mb_id_count or None)
         return ()
 
     @property
@@ -1098,7 +1133,7 @@ def _apev2_get_multi(tags: APEv2, key: str) -> list[str] | None:
     :param key: Tag key.
     """
     values = _apev2_get_values(tags, key)
-    return values if values else None
+    return values or None
 
 
 def _parse_apev2_tags(tags: APEv2) -> dict[str, Any]:  # noqa: PLR0915
