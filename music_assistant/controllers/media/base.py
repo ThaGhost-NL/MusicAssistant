@@ -24,12 +24,18 @@ from music_assistant_models.media_items import (
     Track,
 )
 
-from music_assistant.constants import DB_TABLE_PLAYLOG, DB_TABLE_PROVIDER_MAPPINGS, MASS_LOGGER_NAME
+from music_assistant.constants import (
+    DB_TABLE_GENRE_MEDIA_ITEM_EXCLUSION,
+    DB_TABLE_GENRE_MEDIA_ITEM_MAPPING,
+    DB_TABLE_PLAYLOG,
+    DB_TABLE_PROVIDER_MAPPINGS,
+    MASS_LOGGER_NAME,
+)
 from music_assistant.controllers.webserver.helpers.auth_middleware import get_current_user
 from music_assistant.helpers.compare import compare_media_item, create_safe_string
 from music_assistant.helpers.database import UNSET
 from music_assistant.helpers.json import json_loads, serialize_to_json
-from music_assistant.helpers.util import guard_single_request
+from music_assistant.helpers.util import guard_single_request, parse_optional_bool
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Mapping
@@ -49,6 +55,8 @@ JSON_KEYS = (
     "external_ids",
     "narrators",
     "authors",
+    "genre_aliases",
+    "supported_mediatypes",
 )
 
 SORT_KEYS = {
@@ -230,6 +238,11 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
                     "provider": prov_mapping.provider_instance,
                 },
             )
+        # delete genre exclusions for this media item
+        await self.mass.music.database.delete(
+            DB_TABLE_GENRE_MEDIA_ITEM_EXCLUSION,
+            {"media_type": self.media_type.value, "media_id": db_id},
+        )
         # NOTE: this does not delete any references to this item in other records,
         # this is handled/overridden in the mediatype specific controllers
         self.mass.signal_event(EventType.MEDIA_ITEM_DELETED, library_item.uri, library_item)
@@ -250,6 +263,8 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         offset: int = 0,
         order_by: str = "sort_name",
         provider: str | list[str] | None = None,
+        genre: int | list[int] | None = None,
+        **kwargs: Any,
     ) -> list[ItemCls]:
         """
         Get the library items for this mediatype.
@@ -260,6 +275,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         :param offset: Number of items to skip.
         :param order_by: Order by field (e.g. 'sort_name', 'timestamp_added').
         :param provider: Filter by provider instance ID (single string or list).
+        :param genre: Filter by genre id(s).
         """
         return await self.get_library_items_by_query(
             favorite=favorite,
@@ -268,6 +284,8 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             offset=offset,
             order_by=order_by,
             provider_filter=self._ensure_provider_filter(provider),
+            genre_ids=genre,
+            in_library_only=True,
         )
 
     async def iter_library_items(
@@ -276,6 +294,8 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         search: str | None = None,
         order_by: str = "sort_name",
         provider: str | list[str] | None = None,
+        genre: int | list[int] | None = None,
+        library_items_only: bool = True,
     ) -> AsyncGenerator[ItemCls, None]:
         """Iterate all in-database items."""
         limit: int = 500
@@ -288,10 +308,12 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             next_items = await self.get_library_items_by_query(
                 favorite=favorite,
                 search=search,
+                genre_ids=genre,
                 limit=limit,
                 offset=offset,
                 order_by=order_by,
                 provider_filter=provider_filter,
+                in_library_only=library_items_only,
             )
             for item in next_items:
                 yield item
@@ -370,6 +392,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         for db_item in await self.get_library_items_by_query(
             extra_query_parts=[extra_query],
             extra_query_params={"item_id": db_id},
+            in_library_only=False,
         ):
             return db_item
         msg = f"{self.media_type.value} not found in library: {db_id}"
@@ -479,6 +502,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             offset=offset,
             extra_query_parts=[query],
             extra_query_params=query_params,
+            in_library_only=False,
         )
 
     @final
@@ -846,7 +870,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         """
 
     @final
-    async def get_library_items_by_query(
+    async def get_library_items_by_query(  # noqa: PLR0913
         self,
         favorite: bool | None = None,
         search: str | None = None,
@@ -857,12 +881,15 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         extra_query_parts: list[str] | None = None,
         extra_query_params: dict[str, Any] | None = None,
         extra_join_parts: list[str] | None = None,
+        genre_ids: int | list[int] | None = None,
+        in_library_only: bool = False,
     ) -> list[ItemCls]:
         """Fetch MediaItem records from database by building the query."""
-        query_params = extra_query_params or {}
-        query_parts: list[str] = extra_query_parts or []
-        join_parts: list[str] = extra_join_parts or []
+        query_params = dict(extra_query_params) if extra_query_params else {}
+        query_parts: list[str] = list(extra_query_parts) if extra_query_parts else []
+        join_parts: list[str] = list(extra_join_parts) if extra_join_parts else []
         search = self._preprocess_search(search, query_params)
+        genre_ids = self._preprocess_genre_ids(genre_ids)
         # create special performant random query
         if order_by and order_by.startswith("random"):
             self._apply_random_subquery(
@@ -871,8 +898,10 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
                 join_parts=join_parts,
                 favorite=favorite,
                 search=search,
+                genre_ids=genre_ids,
                 provider_filter=provider_filter,
                 limit=limit,
+                in_library_only=in_library_only,
             )
         else:
             # apply filters
@@ -882,7 +911,9 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
                 join_parts=join_parts,
                 favorite=favorite,
                 search=search,
+                genre_ids=genre_ids,
                 provider_filter=provider_filter,
+                in_library_only=in_library_only,
             )
         # build and execute final query
         sql_query = self._build_final_query(query_parts, join_parts, order_by)
@@ -894,6 +925,11 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             )
         ]
 
+    @property
+    def _search_filter_clause(self) -> str:
+        """Return the SQL WHERE clause fragment used for search filtering."""
+        return f"{self.db_table}.search_name LIKE :search"
+
     @final
     def _preprocess_search(self, search: str | None, query_params: dict[str, Any]) -> str | None:
         """Preprocess search string and add to query params."""
@@ -901,6 +937,17 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             search = create_safe_string(search, True, True)
             query_params["search"] = f"%{search}%"
         return search
+
+    @final
+    @staticmethod
+    def _preprocess_genre_ids(genre_ids: int | list[int] | None) -> list[int] | None:
+        if genre_ids is None:
+            return None
+        if isinstance(genre_ids, list):
+            normalized = [int(x) for x in genre_ids]
+        else:
+            normalized = [int(genre_ids)]
+        return normalized or None
 
     @final
     @staticmethod
@@ -916,8 +963,10 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         join_parts: list[str],
         favorite: bool | None,
         search: str | None,
+        genre_ids: list[int] | None,
         provider_filter: list[str] | None,
         limit: int,
+        in_library_only: bool = False,
     ) -> None:
         """Build a fast random subquery with all filters applied."""
         sub_query_parts = query_parts.copy()
@@ -930,7 +979,9 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             join_parts=sub_join_parts,
             favorite=favorite,
             search=search,
+            genre_ids=genre_ids,
             provider_filter=provider_filter,
+            in_library_only=in_library_only,
         )
 
         # Build the subquery
@@ -958,16 +1009,29 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         join_parts: list[str],
         favorite: bool | None,
         search: str | None,
+        genre_ids: list[int] | None,
         provider_filter: list[str] | None,
+        in_library_only: bool = False,
     ) -> None:
         """Apply search, favorite, and provider filters."""
         # handle search
         if search:
-            query_parts.append(f"{self.db_table}.search_name LIKE :search")
+            query_parts.append(self._search_filter_clause)
         # handle favorite filter
         if favorite is not None:
             query_parts.append(f"{self.db_table}.favorite = :favorite")
             query_params["favorite"] = favorite
+        # handle genre filter
+        if genre_ids:
+            query_params["genre_ids"] = genre_ids
+            query_params["genre_media_type"] = self.media_type.value
+            query_parts.append(
+                f"EXISTS("
+                f"SELECT 1 FROM {DB_TABLE_GENRE_MEDIA_ITEM_MAPPING} gm "
+                f"WHERE gm.media_id = {self.db_table}.item_id "
+                "AND gm.media_type = :genre_media_type "
+                "AND gm.genre_id IN :genre_ids)"
+            )
         # Apply the provider filter
         if provider_filter:
             provider_conditions = []
@@ -976,11 +1040,19 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
                 provider_conditions.append(f"provider_mappings.provider_instance = :{param_name}")
                 query_params[param_name] = prov
             query_params["provider_media_type"] = self.media_type.value
+            in_library_clause = "AND provider_mappings.in_library = 1 " if in_library_only else ""
             join_parts.append(
                 f"JOIN provider_mappings ON provider_mappings.item_id = {self.db_table}.item_id "
                 "AND provider_mappings.media_type = :provider_media_type "
-                "AND provider_mappings.in_library = 1 "
+                f"{in_library_clause}"
                 f"AND ({' OR '.join(provider_conditions)})"
+            )
+        elif in_library_only:
+            query_params["provider_media_type"] = self.media_type.value
+            join_parts.append(
+                f"JOIN provider_mappings ON provider_mappings.item_id = {self.db_table}.item_id "
+                "AND provider_mappings.media_type = :provider_media_type "
+                "AND provider_mappings.in_library = 1"
             )
 
     @final
@@ -1030,6 +1102,10 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
                 continue
             db_row_dict[key] = json_loads(raw_value)
 
+        # parse "fully_played" as bool if present in the row
+        if "fully_played" in db_row_dict:
+            db_row_dict["fully_played"] = parse_optional_bool(db_row_dict["fully_played"])
+
         # copy track_album --> album
         if track_album := db_row_dict.get("track_album"):
             db_row_dict["album"] = track_album
@@ -1039,8 +1115,10 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             if (album_images := track_album.get("images")) and (
                 album_thumb := next((x for x in album_images if x["type"] == "thumb"), None)
             ):
-                # copy album image to itemmapping single image
+                # copy album image to itemmapping single image (on the track)
                 db_row_dict["image"] = album_thumb
+                # also set image on the album dict for ItemMapping compatibility
+                track_album["image"] = album_thumb
                 if db_row_dict["metadata"].get("images"):
                     # merge album image with existing images
                     db_row_dict["metadata"]["images"] = [
@@ -1049,6 +1127,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
                     ]
                 else:
                     db_row_dict["metadata"]["images"] = [album_thumb]
+
         return db_row_dict
 
     @final

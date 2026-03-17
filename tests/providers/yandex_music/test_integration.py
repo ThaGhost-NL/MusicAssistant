@@ -18,6 +18,7 @@ from yandex_music import Track as YandexTrack
 
 from music_assistant.mass import MusicAssistant
 from music_assistant.models.music_provider import MusicProvider
+from music_assistant.providers.yandex_music.constants import BROWSE_NAMES_EN, BROWSE_NAMES_RU
 from tests.common import wait_for_sync_completion
 
 if TYPE_CHECKING:
@@ -133,6 +134,8 @@ async def yandex_music_provider(
         mock_client.get_artist_tracks = mock.AsyncMock(return_value=[track])
         mock_client.get_playlist = mock.AsyncMock(return_value=playlist)
         mock_client.get_track_download_info = mock.AsyncMock(return_value=[download_info])
+        mock_client.get_track_lyrics = mock.AsyncMock(return_value=(None, False))
+        mock_client.get_track_lyrics_from_track = mock.AsyncMock(return_value=(None, False))
 
         async with wait_for_sync_completion(mass):
             config = await mass.config.save_provider_config(
@@ -207,6 +210,8 @@ async def yandex_music_provider_lossless(
         # get-file-info lossless is tried first; mock returns None so we use download_info path
         mock_client.get_track_file_info_lossless = mock.AsyncMock(return_value=None)
         mock_client.get_track_download_info = mock.AsyncMock(return_value=download_infos)
+        mock_client.get_track_lyrics = mock.AsyncMock(return_value=(None, False))
+        mock_client.get_track_lyrics_from_track = mock.AsyncMock(return_value=(None, False))
 
         async with wait_for_sync_completion(mass):
             config = await mass.config.save_provider_config(
@@ -356,6 +361,12 @@ async def test_browse(mass: MusicAssistant) -> None:
     root_items = await prov.browse(path=base_path)
     assert root_items is not None
     assert isinstance(root_items, (list, tuple))
+    all_names = set(BROWSE_NAMES_RU.values()) | set(BROWSE_NAMES_EN.values())
+    if root_items:
+        first_name = getattr(root_items[0], "name", None)
+        assert first_name in all_names, (
+            f"First folder name {first_name!r} should be from locale mapping"
+        )
 
     artists_path = f"{prov.instance_id}://artists"
     artists_items = await prov.browse(path=artists_path)

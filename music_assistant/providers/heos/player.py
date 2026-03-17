@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import logging
 from copy import copy
 from typing import TYPE_CHECKING, cast
 
 from music_assistant_models.enums import MediaType, PlaybackState, PlayerFeature, PlayerType
 from music_assistant_models.errors import SetupFailedError
 from music_assistant_models.player import DeviceInfo, PlayerSource
-from pyheos import Heos, const
+from pyheos import Heos, HeosError, const
 
-from music_assistant.constants import create_sample_rates_config_entry
+from music_assistant.constants import (
+    VERBOSE_LOG_LEVEL,
+    create_sample_rates_config_entry,
+)
 from music_assistant.models.player import Player, PlayerMedia
 from music_assistant.providers.heos.helpers import media_uri_from_now_playing_media
 
@@ -30,6 +34,7 @@ PLAYER_FEATURES = {
     PlayerFeature.NEXT_PREVIOUS,
     PlayerFeature.SELECT_SOURCE,
     PlayerFeature.SET_MEMBERS,
+    PlayerFeature.PLAY_MEDIA,
 }
 
 
@@ -63,7 +68,7 @@ class HeosPlayer(Player):
     async def setup(self) -> None:
         """Set up the player."""
         self.set_device_info()
-        self.set_dynamic_attributes()
+        self.set_dynamic_attributes(update_media=True)
 
         await self.mass.players.register_or_update(self)
 
@@ -127,8 +132,16 @@ class HeosPlayer(Player):
 
     async def _player_event_received(self, event: str) -> None:
         """Handle player device events."""
-        self.logger.debug("[%s] Event received: %s", self._device.name, event)
-
+        self.logger.log(
+            (
+                VERBOSE_LOG_LEVEL
+                if event == const.EVENT_PLAYER_NOW_PLAYING_PROGRESS
+                else logging.DEBUG
+            ),
+            "[%s] Event received: %s",
+            self._device.name,
+            event,
+        )
         match event:
             case const.EVENT_PLAYER_STATE_CHANGED:
                 self._update_player_state()
@@ -142,6 +155,12 @@ class HeosPlayer(Player):
 
             case const.EVENT_PLAYER_VOLUME_CHANGED:
                 self._update_player_volume()
+
+            case const.EVENT_PLAYER_PLAYBACK_ERROR:
+                self.logger.error(
+                    "[%s] Playback error: %s", self._device.name, self._device.playback_error
+                )
+                self.set_dynamic_attributes()
 
             case _:
                 # Update everything on other events
@@ -214,11 +233,14 @@ class HeosPlayer(Player):
             else None
         )
 
-    def set_dynamic_attributes(self) -> None:
+    def set_dynamic_attributes(self, update_media: bool = False) -> None:
         """Update all player dynamic attributes."""
         self._update_player_volume()
         self._update_player_state()
-        self._update_player_current_media()
+
+        if update_media:
+            self._update_player_current_media()
+
         self._update_player_playing_progress()
 
     async def volume_set(self, volume_level: int) -> None:
@@ -254,7 +276,27 @@ class HeosPlayer(Player):
 
     async def play_media(self, media: PlayerMedia) -> None:
         """Handle PLAY MEDIA command on given player."""
-        await self._device.play_url(media.uri)
+        self.logger.debug(
+            "[%s] Received PLAY_MEDIA command with media_type=%s uri=%s",
+            self._device.name,
+            media.media_type,
+            media.uri,
+        )
+
+        try:
+            queue_items = await self._device.get_queue(range_start=0, range_end=1)
+
+            if queue_items:
+                await self._device.clear_queue()
+        except HeosError as err:
+            self.logger.warning(
+                "[%s] Failed to fetch HEOS queue before play_media, continuing: %s",
+                self._device.name,
+                err,
+            )
+
+        url = await self.provider.mass.streams.resolve_stream_url(self.player_id, media)
+        await self._device.play_url(url)
 
         self._attr_current_media = media
         self._attr_active_source = self.player_id
@@ -287,6 +329,11 @@ class HeosPlayer(Player):
         else:
             await self._heos.set_group([int(player) for player in members])
         # group_members will be updated when group_changed event is handled
+
+    async def select_source(self, source: str) -> None:
+        """Handle SELECT SOURCE command on the player."""
+        self.logger.debug("[%s] Selecting source %s", self._device.name, source)
+        await self._device.play_input_source(source)
 
     async def get_config_entries(
         self,

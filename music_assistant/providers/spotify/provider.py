@@ -610,7 +610,12 @@ class SpotifyProvider(MusicProvider):
         spotify_result = await self._get_data_with_caching(
             uri, cache_checksum, limit=page_size, offset=offset, use_global_session=use_global
         )
+        total = spotify_result.get("total", 0)
         for index, item in enumerate(spotify_result["items"], 1):
+            # Spotify wraps/recycles items for offsets beyond the playlist size,
+            # so we need to break when we've reached the total.
+            if (offset + index) > total:
+                break
             if not (item and item["track"] and item["track"]["id"]):
                 continue
             track = parse_track(item["track"], self)
@@ -694,7 +699,7 @@ class SpotifyProvider(MusicProvider):
         data = {"tracks": track_uris}
         await self._delete_data(f"playlists/{prov_playlist_id}/tracks", data=data)
 
-    async def create_playlist(self, name: str) -> Playlist:
+    async def create_playlist(self, name: str, media_types: set[MediaType]) -> Playlist:
         """Create a new playlist on provider with given name."""
         if self._sp_user is None:
             raise LoginFailed("User info not available - not logged in")

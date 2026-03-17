@@ -9,13 +9,14 @@ import re
 import struct
 import time
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from functools import partial
 from io import BytesIO
-from typing import TYPE_CHECKING, Final, cast
+from typing import TYPE_CHECKING, Any, Final, cast
 
 import aiofiles
 import shortuuid
-from aiohttp import ClientTimeout
+from aiohttp import ClientConnectorSSLError, ClientTimeout
 from music_assistant_models.dsp import DSPConfig, DSPDetails, DSPState
 from music_assistant_models.enums import (
     ContentType,
@@ -37,6 +38,7 @@ from music_assistant_models.streamdetails import MultiPartPath
 
 from music_assistant.constants import (
     CONF_ENTRY_OUTPUT_LIMITER,
+    CONF_ENTRY_VOLUME_NORMALIZATION_TARGET,
     CONF_OUTPUT_CHANNELS,
     CONF_VOLUME_NORMALIZATION,
     CONF_VOLUME_NORMALIZATION_RADIO,
@@ -45,11 +47,12 @@ from music_assistant.constants import (
     MASS_LOGGER_NAME,
     VERBOSE_LOG_LEVEL,
 )
-from music_assistant.controllers.players.sync_groups import SyncGroupPlayer
 from music_assistant.helpers.json import JSON_DECODE_EXCEPTIONS, json_loads
 from music_assistant.helpers.throttle_retry import BYPASS_THROTTLER
 from music_assistant.helpers.util import clean_stream_title, remove_file
+from music_assistant.providers.sync_group.constants import SGP_PREFIX
 
+from . import ssl as ssl_util
 from .audio_buffer import AudioBuffer
 from .dsp import filter_to_ffmpeg_params
 from .ffmpeg import FFMpeg, get_ffmpeg_args, get_ffmpeg_stream
@@ -65,6 +68,7 @@ if TYPE_CHECKING:
     from music_assistant.mass import MusicAssistant
     from music_assistant.models.music_provider import MusicProvider
     from music_assistant.models.player import Player
+    from music_assistant.providers.sync_group import SyncGroupPlayer
 
 LOGGER = logging.getLogger(f"{MASS_LOGGER_NAME}.audio")
 
@@ -74,6 +78,26 @@ HTTP_HEADERS = {"User-Agent": "Lavf/60.16.100.MusicAssistant"}
 HTTP_HEADERS_ICY = {**HTTP_HEADERS, "Icy-MetaData": "1"}
 
 SLOW_PROVIDERS = ("tidal", "ytmusic", "apple_music")
+
+# Mapping of audio format identifiers to their correct IANA MIME types
+# where the format name differs from the MIME subtype.
+# Strict DLNA/UPnP devices reject non-standard MIME types (e.g. audio/mp3).
+_MIME_TYPE_OVERRIDES: Final[dict[str, str]] = {
+    "mp3": "audio/mpeg",
+}
+
+
+def get_mime_type(format_str: str) -> str:
+    """Get the proper IANA MIME type for a given audio format string.
+
+    :param format_str: The audio format string (e.g. "mp3", "flac",
+        "pcm;codec=pcm;rate=44100;bitrate=16;channels=2").
+    """
+    base_format = format_str.split(";", maxsplit=1)[0]
+    if override := _MIME_TYPE_OVERRIDES.get(base_format):
+        return override
+    return f"audio/{format_str}"
+
 
 CACHE_CATEGORY_RESOLVED_RADIO_URL: Final[int] = 100
 CACHE_PROVIDER: Final[str] = "audio"
@@ -186,16 +210,17 @@ def get_stream_dsp_details(
     queue_id: str,
 ) -> dict[str, DSPDetails]:
     """Return DSP details of all players playing this queue, keyed by player_id."""
-    player = mass.players.get(queue_id)
+    player = mass.players.get_player(queue_id)
     dsp: dict[str, DSPDetails] = {}
     assert player is not None  # for type checking
     group_preventing_dsp = is_grouping_preventing_dsp(player)
     output_format = None
     is_external_group = False
 
-    if player.type == PlayerType.GROUP and isinstance(player, SyncGroupPlayer):
+    if player.player_id.startswith(SGP_PREFIX):
         if group_preventing_dsp:
-            if sync_leader := player.sync_leader:
+            sgp_player = cast("SyncGroupPlayer", player)
+            if sync_leader := sgp_player.sync_leader:
                 output_format = sync_leader.extra_data.get("output_format", None)
     else:
         # We only add real players (so skip the PlayerGroups as they only sync containing players)
@@ -205,17 +230,17 @@ def get_stream_dsp_details(
             # The leader is responsible for sending the (combined) audio stream, so get
             # the output format from the leader.
             output_format = player.extra_data.get("output_format", None)
-        is_external_group = player.type in (PlayerType.GROUP, PlayerType.STEREO_PAIR)
+        is_external_group = player.state.type in (PlayerType.GROUP, PlayerType.STEREO_PAIR)
 
     # We don't enumerate all group members in case this group is externally created
     # (e.g. a Chromecast group from the Google Home app)
-    if player and player.group_members and not is_external_group:
+    if player and player.state.group_members and not is_external_group:
         # grouped playback, get DSP details for each player in the group
-        for child_id in player.group_members:
+        for child_id in player.state.group_members:
             # skip if we already have the details (so if it's the group leader)
             if child_id in dsp:
                 continue
-            if child_player := mass.players.get(child_id):
+            if child_player := mass.players.get_player(child_id):
                 dsp[child_id] = get_player_dsp_details(
                     mass, child_player, group_preventing_dsp=group_preventing_dsp
                 )
@@ -278,6 +303,8 @@ async def get_stream_details(
         else:
             preferred_providers = [x.provider_instance for x in media_item.provider_mappings]
         for allow_other_provider in (False, True):
+            if streamdetails:
+                break
             # sort by quality and check item's availability
             for prov_media in sorted(
                 media_item.provider_mappings, key=lambda x: x.quality or 0, reverse=True
@@ -323,8 +350,8 @@ async def get_stream_details(
             resolved_url, stream_type = await resolve_radio_stream(mass, streamdetails.path)
             streamdetails.path = resolved_url
             streamdetails.stream_type = stream_type
-            # Set up metadata monitoring callback for HLS radio streams
-            if stream_type == StreamType.HLS:
+            # Set up metadata monitoring callback for HLS radio streams, if not already set
+            if stream_type == StreamType.HLS and not streamdetails.stream_metadata_update_callback:
                 streamdetails.stream_metadata_update_callback = partial(
                     _update_hls_radio_metadata, mass
                 )
@@ -351,12 +378,22 @@ async def get_stream_details(
     conf_volume_normalization_target = float(
         str(player_settings.get_value(CONF_VOLUME_NORMALIZATION_TARGET, -17))
     )
-    if conf_volume_normalization_target < -30 or conf_volume_normalization_target >= 0:
-        conf_volume_normalization_target = -17.0  # reset to default if out of bounds
+    # guard against invalid volume normalization values
+    # range and default_value are guaranteed to be set for this constant
+    volume_range = CONF_ENTRY_VOLUME_NORMALIZATION_TARGET.range
+    assert volume_range is not None
+    if (
+        conf_volume_normalization_target < volume_range[0]
+        or conf_volume_normalization_target >= volume_range[1]
+    ):
+        default_val = CONF_ENTRY_VOLUME_NORMALIZATION_TARGET.default_value
+        assert isinstance(default_val, (int, float))
+        conf_volume_normalization_target = float(default_val)
         LOGGER.warning(
             "Invalid volume normalization target configured for player %s, "
-            "resetting to default of -17.0 dB",
+            "resetting to default of %s dB",
             streamdetails.queue_id,
+            CONF_ENTRY_VOLUME_NORMALIZATION_TARGET.default_value,
         )
     streamdetails.target_loudness = conf_volume_normalization_target
     streamdetails.volume_normalization_mode = _get_normalization_mode(
@@ -724,6 +761,31 @@ def create_wave_header(
     return file.getvalue()
 
 
+@asynccontextmanager
+async def _connect_radio_stream(
+    mass: MusicAssistant, url: str, **kwargs: Any
+) -> AsyncGenerator[Any, None]:
+    """Connect to a radio stream URL with fallback for legacy SSL/TLS configurations.
+
+    Some radio servers use outdated TLS configurations that reject modern cipher suites.
+    Since radio streams are public broadcast content, relaxing cipher requirements is acceptable.
+    :param mass: The MusicAssistant instance.
+    :param url: The radio stream URL to connect to.
+    :param kwargs: Additional keyword arguments passed to aiohttp get().
+    """
+    try:
+        async with mass.http_session_no_ssl.get(url, **kwargs) as resp:
+            yield resp
+    except ClientConnectorSSLError:
+        LOGGER.info(
+            "SSL handshake failed for %s, retrying with permissive cipher configuration",
+            url,
+        )
+        insecure_ssl_context = ssl_util.client_context_no_verify(ssl_util.SSLCipherList.INSECURE)
+        async with mass.http_session_no_ssl.get(url, ssl=insecure_ssl_context, **kwargs) as resp:
+            yield resp
+
+
 async def resolve_radio_stream(mass: MusicAssistant, url: str) -> tuple[str, StreamType]:
     """
     Resolve a streaming radio URL.
@@ -745,8 +807,8 @@ async def resolve_radio_stream(mass: MusicAssistant, url: str) -> tuple[str, Str
     resolved_url = url
     timeout = ClientTimeout(total=None, connect=10, sock_read=5)
     try:
-        async with mass.http_session_no_ssl.get(
-            url, headers=HTTP_HEADERS_ICY, allow_redirects=True, timeout=timeout
+        async with _connect_radio_stream(
+            mass, url, headers=HTTP_HEADERS_ICY, allow_redirects=True, timeout=timeout
         ) as resp:
             headers = resp.headers
             resp.raise_for_status()
@@ -797,8 +859,8 @@ async def get_icy_radio_stream(
     """Get (radio) audio stream from HTTP, including ICY metadata retrieval."""
     timeout = ClientTimeout(total=None, connect=30, sock_read=5 * 60)
     LOGGER.debug("Start streaming radio with ICY metadata from url %s", url)
-    async with mass.http_session_no_ssl.get(
-        url, allow_redirects=True, headers=HTTP_HEADERS_ICY, timeout=timeout
+    async with _connect_radio_stream(
+        mass, url, allow_redirects=True, headers=HTTP_HEADERS_ICY, timeout=timeout
     ) as resp:
         headers = resp.headers
         meta_int = int(headers["icy-metaint"])
@@ -1340,17 +1402,17 @@ def is_grouping_preventing_dsp(player: Player) -> bool:
     If this returns True, no DSP should be applied to the player.
     This function will not check if the Player is in a group, the caller should do that first.
     """
-    # We require the caller to handle non-leader cases themselves since player.synced_to
+    # We require the caller to handle non-leader cases themselves since player.state.synced_to
     # can be unreliable in some edge cases
-    multi_device_dsp_supported = PlayerFeature.MULTI_DEVICE_DSP in player.supported_features
-    child_count = len(player.group_members) if player.group_members else 0
+    multi_device_dsp_supported = PlayerFeature.MULTI_DEVICE_DSP in player.state.supported_features
+    child_count = len(player.state.group_members) if player.state.group_members else 0
 
     is_multiple_devices: bool
     if player.provider.domain == "player_group":
         # PlayerGroups have no leader, so having a child count of 1 means
         # the group actually contains only a single player.
         is_multiple_devices = child_count > 1
-    elif player.type == PlayerType.GROUP:
+    elif player.state.type == PlayerType.GROUP:
         # This is an group player external to Music Assistant.
         is_multiple_devices = True
     else:
@@ -1366,12 +1428,12 @@ def is_output_limiter_enabled(mass: MusicAssistant, player: Player) -> bool:
     decides if the limiter should be turned on or not.
     """
     deciding_player_id = player.player_id
-    if player.active_group:
+    if player.state.active_group:
         # Syncgroup, get from the group player
-        deciding_player_id = player.active_group
-    elif player.synced_to:
+        deciding_player_id = player.state.active_group
+    elif player.state.synced_to:
         # Not in sync group, but synced, get from the leader
-        deciding_player_id = player.synced_to
+        deciding_player_id = player.state.synced_to
     output_limiter_enabled = mass.config.get_raw_player_config_value(
         deciding_player_id,
         CONF_ENTRY_OUTPUT_LIMITER.key,
@@ -1389,23 +1451,29 @@ def get_player_filter_params(
     """Get player specific filter parameters for ffmpeg (if any)."""
     filter_params = []
 
-    dsp = mass.config.get_player_dsp_config(player_id)
+    player = mass.players.get_player(player_id)
+    # In case this is a protocol player, their DSP config is stored
+    # under the parent (native or universal) player that wraps them.
+    dsp_player_id = player_id
+    if player and player.protocol_parent_id:
+        dsp_player_id = player.protocol_parent_id
+    dsp = mass.config.get_player_dsp_config(dsp_player_id)
     limiter_enabled = True
 
-    if player := mass.players.get(player_id):
+    if player:
         if is_grouping_preventing_dsp(player):
             # We can not correctly apply DSP to a grouped player without multi-device DSP support,
             # so we disable it.
             dsp.enabled = False
         elif player.provider.domain == "player_group" and (
-            PlayerFeature.MULTI_DEVICE_DSP not in player.supported_features
+            PlayerFeature.MULTI_DEVICE_DSP not in player.state.supported_features
         ):
             # This is a special case! We have a player group where:
             # - The group leader does not support MULTI_DEVICE_DSP
             # - But only contains a single player (since nothing is preventing DSP)
             # We can still apply the DSP of that single player.
-            if player.group_members:
-                child_player = mass.players.get(player.group_members[0])
+            if player.state.group_members:
+                child_player = mass.players.get_player(player.state.group_members[0])
                 assert child_player is not None  # for type checking
                 dsp = mass.config.get_player_dsp_config(child_player.player_id)
             else:

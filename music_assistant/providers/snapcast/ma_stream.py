@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import time
 import urllib.parse
 from contextlib import suppress
 from typing import TYPE_CHECKING, cast
@@ -84,6 +85,7 @@ class SnapcastMAStream:
         self._is_streaming = False
         self._restart_requested: bool = False
         self._stop_requested: bool = False
+        self._streaming_started_at: float | None = None
 
         self._socket_server: SnapcastSocketServer | None = None
         self._socket_path: str | None = None
@@ -110,6 +112,22 @@ class SnapcastMAStream:
     def is_streaming(self) -> bool:
         """Return True if the FFmpeg streaming task is currently running."""
         return self._is_streaming
+
+    @property
+    def playback_started_at(self) -> float | None:
+        """Return when the playback started at the clients.
+
+        return The (UTC) timestamp when the playback was started on the client
+        or None if not started yet or not streaming.
+        """
+        if self._streaming_started_at is None:
+            return None
+        if self._provider._use_builtin_server:
+            buffer_ms = self._provider._snapcast_server_buffer_size
+            if time.time() - self._streaming_started_at < buffer_ms / 1000.0:
+                return None
+            return self._streaming_started_at + buffer_ms / 1000.0
+        return self._streaming_started_at
 
     async def setup(self) -> None:
         """Prepare the Snapcast stream resources.
@@ -276,7 +294,9 @@ class SnapcastMAStream:
                 DEFAULT_SNAPCAST_FORMAT,
                 DEFAULT_SNAPCAST_FORMAT,
             )
-        audio_source = self._mass.streams.get_stream(self.media, DEFAULT_SNAPCAST_FORMAT)
+        audio_source = self._mass.streams.get_stream(
+            self.media, DEFAULT_SNAPCAST_FORMAT, self._filter_settings_owner
+        )
         try:
             async with FFMpeg(
                 audio_input=audio_source,
@@ -288,6 +308,7 @@ class SnapcastMAStream:
             ) as ffmpeg_proc:
                 wait_ffmpeg = self._mass.create_task(ffmpeg_proc.wait())
                 wait_stop = self._mass.create_task(self._stop_streamer_evt.wait())
+                self._streaming_started_at = time.time()
                 self._streamer_started_evt.set()
                 self._is_streaming = True
 
@@ -306,30 +327,39 @@ class SnapcastMAStream:
                 for t in pending:
                     t.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
-
+        except asyncio.CancelledError:
+            self._logger.debug("Snapcast stream %s cancelled", self.stream_name)
+            raise
+        except Exception as err:
+            self._logger.error("Snapcast stream %s error: %s", self.stream_name, err, exc_info=err)
+            raise
         finally:
             self._is_streaming = False
             self._logger.debug("Finished streaming to %s", stream_path)
-            # Wait a bit for snap stream to become idle
-            try:
+            await self._wait_stream_idle()
 
-                async def wait_until_idle() -> None:
-                    while True:
-                        stream_is_idle = False
-                        with suppress(KeyError):
-                            snap_stream = self._provider._snapserver.stream(self.stream_name)
-                            stream_is_idle = snap_stream.status == "idle"
-                        if self._mass.closing or stream_is_idle:
-                            break
-                        await asyncio.sleep(0.25)
+    async def _wait_stream_idle(self) -> None:
+        """Wait for the Snapcast stream to become idle after streaming ends."""
+        try:
 
-                await asyncio.wait_for(wait_until_idle(), timeout=10.0)
+            async def wait_until_idle() -> None:
+                while True:
+                    stream_is_idle = False
+                    with suppress(KeyError):
+                        snap_stream = self._provider._snapserver.stream(self.stream_name)
+                        stream_is_idle = snap_stream.status == "idle"
+                    if self._mass.closing or stream_is_idle:
+                        break
+                    await asyncio.sleep(0.25)
 
-            except TimeoutError:
-                self._logger.warning(
-                    "Timeout waiting for stream %s to become idle",
-                    self.stream_name,
-                )
+            await asyncio.wait_for(wait_until_idle(), timeout=10.0)
+        except TimeoutError:
+            self._logger.warning(
+                "Timeout waiting for stream %s to become idle",
+                self.stream_name,
+            )
+        finally:
+            self._streaming_started_at = None
 
     def _on_streamer_done(self, t: asyncio.Task[None]) -> None:
         """Handle streamer task completion and optional cleanup."""

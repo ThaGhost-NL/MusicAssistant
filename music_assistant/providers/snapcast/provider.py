@@ -19,6 +19,7 @@ from snapcast.control.server import CONTROL_PORT, Snapserver
 from zeroconf import NonUniqueNameException
 from zeroconf.asyncio import AsyncServiceInfo
 
+from music_assistant.constants import CONF_ENABLED
 from music_assistant.helpers.compare import create_safe_string
 from music_assistant.helpers.process import AsyncProcess
 from music_assistant.helpers.util import get_ip_pton
@@ -168,7 +169,7 @@ class SnapCastProvider(PlayerProvider):
 
         for snap_client in self._snapserver.clients:
             player_id = self._get_ma_id(snap_client.identifier)
-            if not (player := self.mass.players.get(player_id, raise_unavailable=False)):
+            if not (player := self.mass.players.get_player(player_id, raise_unavailable=False)):
                 continue
             if player.playback_state != PlaybackState.PLAYING:
                 continue
@@ -347,10 +348,13 @@ class SnapCastProvider(PlayerProvider):
             return new_id
         return self._get_ma_id(snap_client_id)
 
-    def _handle_player_init(self, snap_client: SnapclientProto) -> SnapCastPlayer:
+    def _handle_player_init(self, snap_client: SnapclientProto) -> SnapCastPlayer | None:
         """Process Snapcast add to Player controller."""
         player_id = self._generate_and_register_id(snap_client.identifier)
-        player = self.mass.players.get(player_id, raise_unavailable=False)
+        if not self.mass.config.get_raw_player_config_value(player_id, CONF_ENABLED, True):
+            self.logger.debug("Ignoring disabled snapcast player: %s", player_id)
+            return None
+        player = self.mass.players.get_player(player_id, raise_unavailable=False)
         if not player:
             snap_client = self._snapserver.client(self._get_snapclient_id(player_id))
             player = SnapCastPlayer(
@@ -521,7 +525,7 @@ class SnapCastProvider(PlayerProvider):
             self._snapserver.synchronize(res)
             for client_id in group_members:
                 ma_player_id = self._get_ma_id(client_id)
-                if ma_player := cast("SnapCastPlayer", self.mass.players.get(ma_player_id)):
+                if ma_player := cast("SnapCastPlayer", self.mass.players.get_player(ma_player_id)):
                     client = self._snapserver.client(client_id)
                     if client is not None:
                         if client.group is not None:
@@ -691,7 +695,7 @@ class SnapCastProvider(PlayerProvider):
         if player_id is None:
             return None
 
-        if ma_player := self.mass.players.get(player_id):
+        if ma_player := self.mass.players.get_player(player_id):
             assert isinstance(ma_player, SnapCastPlayer)  # for type checking
             return ma_player
 

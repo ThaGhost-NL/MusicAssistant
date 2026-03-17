@@ -9,10 +9,11 @@ import os
 import os.path
 import time
 import urllib.parse
-from collections.abc import AsyncGenerator, Iterator, Sequence
+from collections.abc import AsyncGenerator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
+from xml.parsers.expat import ExpatError
 
 import aiofiles
 import shortuuid
@@ -88,6 +89,7 @@ from .constants import (
     CONF_ENTRY_LIBRARY_SYNC_TRACKS,
     CONF_ENTRY_MISSING_ALBUM_ARTIST,
     CONF_ENTRY_PATH,
+    CONF_ENTRY_PROPAGATE_GENRES,
     IMAGE_EXTENSIONS,
     PLAYLIST_EXTENSIONS,
     PODCAST_EPISODE_EXTENSIONS,
@@ -96,12 +98,12 @@ from .constants import (
     IsChapterFile,
 )
 from .helpers import (
-    IGNORE_DIRS,
     FileSystemItem,
     get_absolute_path,
     get_album_dir,
     get_artist_dir,
     get_relative_path,
+    recursive_iter,
     sorted_scandir,
 )
 
@@ -155,6 +157,7 @@ async def get_config_entries(
         CONF_ENTRY_LIBRARY_SYNC_PLAYLISTS,
         CONF_ENTRY_LIBRARY_SYNC_PODCASTS,
         CONF_ENTRY_LIBRARY_SYNC_AUDIOBOOKS,
+        CONF_ENTRY_PROPAGATE_GENRES,
     ]
     if instance_id is None or values is None:
         return (CONF_ENTRY_CONTENT_TYPE, *base_entries)
@@ -351,38 +354,13 @@ class LocalFileSystemProvider(MusicProvider):
 
         # NOTE: we do the entire traversing of the directory structure, including parsing tags
         # in a single executor thread to save the overhead of having to spin up tons of tasks
-        def listdir(path: str) -> Iterator[FileSystemItem]:
-            """Recursively traverse directory entries."""
-            for item in os.scandir(path):
-                # ignore invalid filenames
-                if item.name in IGNORE_DIRS or item.name.startswith((".", "_")):
-                    continue
-                if item.is_dir(follow_symlinks=False):
-                    yield from listdir(item.path)
-                elif item.is_file(follow_symlinks=False):
-                    # skip files without extension
-                    if "." not in item.name:
-                        continue
-                    ext = item.name.rsplit(".", 1)[1].lower()
-                    if ext not in SUPPORTED_EXTENSIONS:
-                        # skip unsupported file extension
-                        continue
-                    try:
-                        yield FileSystemItem.from_dir_entry(item, self.base_path)
-                    except OSError as err:
-                        # Skip files that cannot be stat'd (e.g., invalid encoding on SMB mounts)
-                        # This typically happens with emoji or special unicode characters
-                        self.logger.debug(
-                            "Skipping file %s due to stat error: %s",
-                            item.path,
-                            str(err),
-                        )
-
         def run_sync() -> None:
             """Run the actual sync (in an executor job)."""
             self.sync_running = True
             try:
-                for item in listdir(self.base_path):
+                for item in recursive_iter(
+                    self.base_path, self.base_path, SUPPORTED_EXTENSIONS, self.logger
+                ):
                     prev_checksum = file_checksums.get(item.relative_path)
                     if self._process_item(item, prev_checksum):
                         cur_filenames.add(item.relative_path)
@@ -875,7 +853,7 @@ class LocalFileSystemProvider(MusicProvider):
         async with aiofiles.open(playlist_filename, "w", encoding="utf-8") as _file:
             await _file.write(new_playlist_data)
 
-    async def create_playlist(self, name: str) -> Playlist:
+    async def create_playlist(self, name: str, media_types: set[MediaType]) -> Playlist:
         """Create a new playlist on provider with given name."""
         # creating a new playlist on the filesystem is as easy
         # as creating a new (empty) file with the m3u extension...
@@ -1128,19 +1106,26 @@ class LocalFileSystemProvider(MusicProvider):
             # found NFO file with metadata
             # https://kodi.wiki/view/NFO_files/Artists
             nfo_file = self.get_absolute_path(nfo_file)
-            async with aiofiles.open(nfo_file) as _file:
-                data = await _file.read()
-            info = await asyncio.to_thread(xmltodict.parse, data)
-            info = info["artist"]
-            artist.name = info.get("title", info.get("name", name))
-            if sort_name := info.get("sortname"):
-                artist.sort_name = sort_name
-            if mbid := info.get("musicbrainzartistid"):
-                artist.mbid = mbid
-            if description := info.get("biography"):
-                artist.metadata.description = description
-            if genre := info.get("genre"):
-                artist.metadata.genres = set(split_items(genre))
+            try:
+                async with aiofiles.open(nfo_file) as _file:
+                    data = await _file.read()
+                info = await asyncio.to_thread(xmltodict.parse, data)
+                info = info["artist"]
+                artist.name = info.get("title", info.get("name", name))
+                if sort_name := info.get("sortname"):
+                    artist.sort_name = sort_name
+                if mbid := info.get("musicbrainzartistid"):
+                    artist.mbid = mbid
+                if description := info.get("biography"):
+                    artist.metadata.description = description
+                if genre := info.get("genre"):
+                    artist.metadata.genres = set(split_items(genre))
+            except (ExpatError, KeyError) as err:
+                self.logger.warning(
+                    "Failed to parse artist NFO file %s: %s",
+                    nfo_file,
+                    str(err),
+                )
         # find local images
         if images := await self._get_local_images(artist_path, extra_thumb_names=("artist",)):
             artist.metadata.images = UniqueList(images)
@@ -1543,26 +1528,33 @@ class LocalFileSystemProvider(MusicProvider):
                 # found NFO file with metadata
                 # https://kodi.wiki/view/NFO_files/Artists
                 nfo_file = self.get_absolute_path(nfo_file)
-                async with aiofiles.open(nfo_file) as _file:
-                    data = await _file.read()
-                info = await asyncio.to_thread(xmltodict.parse, data)
-                info = info["album"]
-                album.name = info.get("title", info.get("name", name))
-                if sort_name := info.get("sortname"):
-                    album.sort_name = sort_name
-                if releasegroup_id := info.get("musicbrainzreleasegroupid"):
-                    album.add_external_id(ExternalID.MB_RELEASEGROUP, releasegroup_id)
-                if album_id := info.get("musicbrainzalbumid"):
-                    album.add_external_id(ExternalID.MB_ALBUM, album_id)
-                if mb_artist_id := info.get("musicbrainzalbumartistid"):
-                    if album.artists and not album.artists[0].mbid:
-                        album.artists[0].mbid = mb_artist_id
-                if description := info.get("review"):
-                    album.metadata.description = description
-                if year := info.get("year"):
-                    album.year = int(year)
-                if genre := info.get("genre"):
-                    album.metadata.genres = set(split_items(genre))
+                try:
+                    async with aiofiles.open(nfo_file) as _file:
+                        data = await _file.read()
+                    info = await asyncio.to_thread(xmltodict.parse, data)
+                    info = info["album"]
+                    album.name = info.get("title", info.get("name", name))
+                    if sort_name := info.get("sortname"):
+                        album.sort_name = sort_name
+                    if releasegroup_id := info.get("musicbrainzreleasegroupid"):
+                        album.add_external_id(ExternalID.MB_RELEASEGROUP, releasegroup_id)
+                    if album_id := info.get("musicbrainzalbumid"):
+                        album.add_external_id(ExternalID.MB_ALBUM, album_id)
+                    if mb_artist_id := info.get("musicbrainzalbumartistid"):
+                        if album.artists and not album.artists[0].mbid:
+                            album.artists[0].mbid = mb_artist_id
+                    if description := info.get("review"):
+                        album.metadata.description = description
+                    if year := info.get("year"):
+                        album.year = int(year)
+                    if genre := info.get("genre"):
+                        album.metadata.genres = set(split_items(genre))
+                except (ExpatError, KeyError) as err:
+                    self.logger.warning(
+                        "Failed to parse album NFO file %s: %s",
+                        nfo_file,
+                        str(err),
+                    )
             # parse name/version
             album.name, album.version = parse_title_and_version(album.name)
             # find local images
@@ -1882,7 +1874,7 @@ class LocalFileSystemProvider(MusicProvider):
                     continue
                 chapters.append(
                     MediaItemChapter(
-                        position=position if use_alphabetical else (chapter_tags.track or position),
+                        position=position,
                         name=chapter_tags.title,
                         start=total_duration,
                         end=total_duration + chapter_tags.duration,
