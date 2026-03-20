@@ -394,6 +394,51 @@ class PlaylistController(MediaControllerBase[Playlist]):
         async for _ in self.tracks(playlist.item_id, playlist.provider, force_refresh=True):
             pass
 
+    @staticmethod
+    def get_track_genres(track: PlaylistPlayableItem) -> set[str]:
+        """Extract genres from a track, falling back to album genres.
+
+        :param track: The track to extract genres from.
+        """
+        if track.metadata.genres:
+            return track.metadata.genres
+        if (
+            isinstance(track, Track)
+            and track.album
+            and isinstance(track.album, Album)
+            and track.album.metadata.genres
+        ):
+            return track.album.metadata.genres
+        return set()
+
+    @staticmethod
+    def filter_playlist_genres(genre_counts: dict[str, int]) -> set[str]:
+        """Filter, sort, and return top playlist genres from occurrence counts.
+
+        :param genre_counts: Mapping of genre name to occurrence count.
+        """
+        if not genre_counts:
+            return set()
+        # for small playlists keep all genres, for larger ones filter to significant ones
+        total = sum(genre_counts.values())
+        if total <= 20:
+            filtered = set(genre_counts.keys())
+        else:
+            min_count = min(5, total // 10)
+            filtered = {genre for genre, count in genre_counts.items() if count > min_count}
+        sorted_genres = sorted(filtered, key=lambda g: genre_counts.get(g, 0), reverse=True)
+        return set(sorted_genres[:8])
+
+    async def _save_playlist_genres(self, playlist: Playlist, genre_counts: dict[str, int]) -> None:
+        """Persist playlist genres from pre-computed counts.
+
+        :param playlist: The playlist to update.
+        :param genre_counts: Mapping of genre name to occurrence count.
+        """
+        cur_item = await self.get_library_item(int(playlist.item_id))
+        cur_item.metadata.genres = self.filter_playlist_genres(genre_counts)
+        await self.update_item_in_library(cur_item.item_id, cur_item, overwrite=True)
+
     async def _handle_add_playlist_tracks(self, db_playlist_id: str | int, uris: list[str]) -> None:
         """Handle adding playlist items inside a managed task."""
         # ruff: noqa: PLR0915
