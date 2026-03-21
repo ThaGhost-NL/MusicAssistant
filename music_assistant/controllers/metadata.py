@@ -301,9 +301,6 @@ class MetaDataController(CoreController):
                 # this shouldn't happen but just in case.
                 raise RuntimeError("Metadata can only be updated for library items")
 
-            # just in case it was in the queue, prevent duplicate lookups
-            if item.uri:
-                self._lookup_jobs.pop(item.uri)
             async with self._throttler:
                 if item.media_type == MediaType.ARTIST:
                     await self._update_artist_metadata(
@@ -798,7 +795,8 @@ class MetaDataController(CoreController):
                 playlist_genres[genre] += 1
             await asyncio.sleep(0)  # yield to eventloop
 
-        playlist.metadata.genres = self.mass.music.playlists.filter_playlist_genres(playlist_genres)
+        filtered_genres = self.mass.music.playlists.filter_playlist_genres(playlist_genres)
+        playlist.metadata.genres = filtered_genres
         # create collage images
         cur_images: list[MediaItemImage] = playlist.metadata.images or []
         new_images = []
