@@ -34,11 +34,15 @@ from music_assistant_models.errors import (
 )
 from music_assistant_models.helpers import get_global_cache_value
 from music_assistant_models.media_items import (
+    Album,
     Artist,
     AudioFormat,
     BrowseFolder,
+    Genre,
     ItemMapping,
     MediaItemType,
+    Playlist,
+    Podcast,
     ProviderMapping,
     RecommendationFolder,
     SearchResults,
@@ -776,13 +780,16 @@ class MusicController(CoreController):
         return result
 
     @api_command("music/item_by_uri")
-    async def get_item_by_uri(self, uri: str) -> MediaItemType | BrowseFolder:
+    async def get_item_by_uri(
+        self, uri: str, allow_update_metadata: bool = False
+    ) -> MediaItemType | BrowseFolder:
         """Fetch MediaItem by uri."""
         media_type, provider_instance_id_or_domain, item_id = await parse_uri(uri)
         return await self.get_item(
             media_type=media_type,
             item_id=item_id,
             provider_instance_id_or_domain=provider_instance_id_or_domain,
+            allow_update_metadata=allow_update_metadata,
         )
 
     @api_command("music/recommendations")
@@ -808,6 +815,7 @@ class MusicController(CoreController):
         media_type: MediaType,
         item_id: str,
         provider_instance_id_or_domain: str,
+        allow_update_metadata: bool = True,
     ) -> MediaItemType | BrowseFolder:
         """Get single music item by id and media type."""
         if provider_instance_id_or_domain == "database":
@@ -830,6 +838,7 @@ class MusicController(CoreController):
         return await ctrl.get(
             item_id=item_id,
             provider_instance_id_or_domain=provider_instance_id_or_domain,
+            allow_update_metadata=allow_update_metadata,
         )
 
     @api_command("music/get_library_item")
@@ -1265,6 +1274,17 @@ class MusicController(CoreController):
                     params,
                     allow_replace=True,
                 )
+
+        # Set seconds_played in accordance with fully_played, if the media_item has
+        # a duration, before it is forwarded to music_providers
+        if seconds_played is None:
+            seconds_played = 0
+            if (
+                fully_played
+                and not isinstance(media_item, Album | Artist | Genre | Playlist | Podcast)
+                and isinstance(media_item.duration, int)  # for Radio duration can be None
+            ):
+                seconds_played = media_item.duration
 
         # forward to provider(s) to sync resume state (e.g. for audiobooks)
         for prov_mapping in media_item.provider_mappings:
