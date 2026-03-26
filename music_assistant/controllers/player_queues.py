@@ -114,6 +114,8 @@ CONF_DEFAULT_ENQUEUE_OPTION_UNKNOWN = "default_enqueue_option_unknown"
 RADIO_TRACK_MAX_DURATION_SECS = 20 * 60  # 20 minutes
 CACHE_CATEGORY_PLAYER_QUEUE_STATE = 0
 CACHE_CATEGORY_PLAYER_QUEUE_ITEMS = 1
+QUEUE_CACHE_EXPIRATION = 4 * 3600  # 4 hours - enough to survive restarts
+RADIO_STALE_THRESHOLD = 30 * 60  # 30 minutes idle before refreshing radio tracks
 
 
 def handle_play_action[PlayerQueuesControllerT: "PlayerQueuesController", **P, R](
@@ -1045,13 +1047,27 @@ class PlayerQueuesController(CoreController):
             queue_player = self.mass.players.get_player(queue_id)
             if queue_player is None:
                 raise PlayerUnavailableError(f"Player {queue_id} is not available")
+            idle_time = time.time() - queue.elapsed_time_last_updated
             if (
                 fade_in is None
                 and queue_player.state.playback_state == PlaybackState.IDLE
-                and (time.time() - queue.elapsed_time_last_updated) > 60
+                and idle_time > 60
             ):
                 # enable fade in effect if the player is idle for a while
                 fade_in = resume_pos > 0
+            # If the queue has been idle long enough and has a radio source,
+            # clear stale upcoming tracks and refill with fresh ones
+            if queue.radio_source and idle_time > RADIO_STALE_THRESHOLD:
+                current_index = queue.current_index or 0
+                keep_count = current_index + 1
+                if len(queue_items) > keep_count:
+                    self.logger.info(
+                        "Refreshing stale radio tracks for queue %s (idle for %d minutes)",
+                        queue.display_name,
+                        int(idle_time / 60),
+                    )
+                    del queue_items[keep_count:]
+                    await self._fill_radio_tracks(queue_id)
             if resume_item.media_type == MediaType.RADIO:
                 # we're not able to skip in online radio so this is pointless
                 resume_pos = 0
@@ -1688,6 +1704,7 @@ class PlayerQueuesController(CoreController):
                     data=cache_data,
                     provider=self.domain,
                     category=CACHE_CATEGORY_PLAYER_QUEUE_ITEMS,
+                    expiration=QUEUE_CACHE_EXPIRATION,
                 )
             )
         # always send the base event
@@ -1701,6 +1718,7 @@ class PlayerQueuesController(CoreController):
                 data=queue.to_cache(),
                 provider=self.domain,
                 category=CACHE_CATEGORY_PLAYER_QUEUE_STATE,
+                expiration=QUEUE_CACHE_EXPIRATION,
             )
         )
 
