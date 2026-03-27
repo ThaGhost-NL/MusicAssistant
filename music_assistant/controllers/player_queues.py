@@ -114,7 +114,6 @@ CONF_DEFAULT_ENQUEUE_OPTION_UNKNOWN = "default_enqueue_option_unknown"
 RADIO_TRACK_MAX_DURATION_SECS = 20 * 60  # 20 minutes
 CACHE_CATEGORY_PLAYER_QUEUE_STATE = 0
 CACHE_CATEGORY_PLAYER_QUEUE_ITEMS = 1
-QUEUE_CACHE_EXPIRATION = 4 * 3600  # 4 hours - enough to survive restarts
 
 
 def handle_play_action[PlayerQueuesControllerT: "PlayerQueuesController", **P, R](
@@ -1689,7 +1688,6 @@ class PlayerQueuesController(CoreController):
                     data=cache_data,
                     provider=self.domain,
                     category=CACHE_CATEGORY_PLAYER_QUEUE_ITEMS,
-                    expiration=QUEUE_CACHE_EXPIRATION,
                 )
             )
         # always send the base event
@@ -1703,7 +1701,6 @@ class PlayerQueuesController(CoreController):
                 data=queue.to_cache(),
                 provider=self.domain,
                 category=CACHE_CATEGORY_PLAYER_QUEUE_STATE,
-                expiration=QUEUE_CACHE_EXPIRATION,
             )
         )
 
